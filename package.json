@@ -10,7 +10,9 @@
     "preview": "vite preview",
     "validate": "node scripts/validate.mjs",
     "test:store": "tsx scripts/test-store.ts",
-    "test:gridlook": "tsx scripts/test-gridlook.ts"
+    "test:gridlook": "tsx scripts/test-gridlook.ts",
+    "emit:kerchunk": "tsx scripts/emit-kerchunk.ts",
+    "open:reference": "tsx scripts/open-reference.ts"
   },
   "dependencies": {
     "@zarrita/storage": "^0.2.0",

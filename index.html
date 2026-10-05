@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="data:," />
+    <title>Virtual COG to Zarr Pilot</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, sans-serif;
+        margin: 2rem;
+        background: #121212;
+        color: #e0e0e0;
+        line-height: 1.5;
+      }
+      h1 { font-size: 1.4rem; }
+      pre {
+        background: #1e1e1e;
+        padding: 1rem;
+        border-radius: 6px;
+        overflow-x: auto;
+        border: 1px solid #333;
+        white-space: pre-wrap;
+      }
+      .status { font-weight: bold; }
+      .ok { color: #4caf50; }
+      .err { color: #f44336; }
+      canvas { border: 1px solid #333; image-rendering: pixelated; margin-top: 1rem; }
+    </style>
+  </head>
+  <body>
+    <h1>Virtual COG &rarr; Zarr Pilot</h1>
+    <p>
+      Dataset:
+      <a href="?dataset=sentinel">Sentinel-2 (projected)</a> &middot;
+      <a href="?dataset=gebco">GEBCO 2026 (geographic, gridlook-ready)</a>
+    </p>
+    <p>Status: <span id="status" class="status">Initializing&hellip;</span></p>
+
+    <h2>Virtualized store metadata</h2>
+    <pre id="output">Loading headers&hellip;</pre>
+
+    <h2>Preview (coarsest overview, read through zarrita)</h2>
+    <canvas id="preview" width="675" height="337"></canvas>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -6,3 +6,7 @@ virtual-cog-pilot.Rproj
 .httr-oauth
 .DS_Store
 .quarto
+.posit/assistant
+node_modules/
+dist/
+*.log

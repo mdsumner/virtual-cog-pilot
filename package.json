@@ -1,0 +1,26 @@
+{
+  "name": "virtual-cog-pilot",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Virtualize a Cloud Optimized GeoTIFF as a Zarr store on the fly, with reusable byte references (kerchunk-style).",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "validate": "node scripts/validate.mjs",
+    "test:store": "tsx scripts/test-store.ts",
+    "test:gridlook": "tsx scripts/test-gridlook.ts"
+  },
+  "dependencies": {
+    "@zarrita/storage": "^0.2.0",
+    "geotiff": "^3.0.5",
+    "numcodecs": "^0.3.2",
+    "zarrita": "^0.7.5"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.4.0",
+    "vite": "^5.4.0"
+  }
+}

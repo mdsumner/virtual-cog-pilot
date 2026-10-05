@@ -71,6 +71,21 @@ npx tsx scripts/test-store.ts <cog-url>      # multiscales layout
 npx tsx scripts/test-gridlook.ts <cog-url>   # GeoZarr (gridlook) layout
 ```
 
+## Deploy (GitHub Pages)
+
+This is a static SPA, so it hosts cleanly on GitHub Pages. A workflow at
+`.github/workflows/deploy.yml` builds on every push to `main` and publishes
+`dist/`. The production `base` is set to `/virtual-cog-pilot/` in `vite.config.ts`
+to match the project-site URL. One-time setup: repo **Settings → Pages → Source:
+GitHub Actions**. The live site is then:
+
+```
+https://mdsumner.github.io/virtual-cog-pilot/
+```
+
+Everything runs in the browser against remote, CORS-enabled COGs — nothing is
+served by Pages except the app itself.
+
 ## Scope
 
 Supported today (pilot): tiled COGs, single band, dtype from TIFF sample format,

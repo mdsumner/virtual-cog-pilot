@@ -58,10 +58,21 @@ npm run validate     # Node: prove the byte-reference round-trip vs geotiff's de
 npm run test:store   # Node: end-to-end refs -> ReferenceStore -> zarrita decode
 ```
 
-In the browser you can switch datasets:
+In the browser, paste any CORS-enabled COG URL into the box and press
+**Virtualize**. The page navigates to a shareable permalink:
 
-- `?dataset=sentinel` — the projected Sentinel-2 tile (multiscales layout).
-- `?dataset=gebco` — GEBCO 2026, built as a CF/GeoZarr regular lat/lon grid.
+- `?url=<cog-url>` virtualizes that file with the multiscales layout.
+- `?url=<cog-url>&layout=gridlook` builds the GeoZarr lat/lon layout (geographic COGs only).
+
+Presets:
+
+- `?dataset=sentinel`: Sentinel-2 L2A B04, 55GEN 2026-03-04 (Hobart, projected, multiscales layout).
+- `?dataset=sentinel-west`: the original 55GCP 2022-11-06 scene (west coast, mostly ocean).
+- `?dataset=gebco`: GEBCO 2026, built as a CF/GeoZarr regular lat/lon grid.
+
+The preview has low/high percentile stretch inputs and a "treat 0 as nodata"
+toggle; they re-render from the array already read, without refetching. The
+status line reports the header-scan and read times.
 
 Point the Node tools at any CORS-enabled COG:
 

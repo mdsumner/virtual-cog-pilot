@@ -14,6 +14,7 @@
         line-height: 1.5;
       }
       h1 { font-size: 1.4rem; }
+      a { color: #8ab4f8; }
       pre {
         background: #1e1e1e;
         padding: 1rem;
@@ -25,22 +26,65 @@
       .status { font-weight: bold; }
       .ok { color: #4caf50; }
       .err { color: #f44336; }
-      canvas { border: 1px solid #333; image-rendering: pixelated; margin-top: 1rem; }
+      canvas { border: 1px solid #333; image-rendering: pixelated; margin-top: 1rem; max-width: 100%; }
+      form, .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        align-items: center;
+        margin: 0.5rem 0;
+      }
+      input, select, button {
+        background: #1e1e1e;
+        color: #e0e0e0;
+        border: 1px solid #444;
+        border-radius: 4px;
+        padding: 0.35rem 0.5rem;
+        font: inherit;
+      }
+      #url { flex: 1 1 32rem; min-width: 0; }
+      .controls input[type="number"] { width: 4.5rem; }
+      button { cursor: pointer; }
+      button:hover { border-color: #8ab4f8; }
+      .hint { color: #999; font-size: 0.9rem; }
     </style>
   </head>
   <body>
     <h1>Virtual COG &rarr; Zarr Pilot</h1>
     <p>
-      Dataset:
-      <a href="?dataset=sentinel">Sentinel-2 (projected)</a> &middot;
+      Presets:
+      <a href="?dataset=sentinel">Sentinel-2 55GEN (Hobart, projected)</a> &middot;
+      <a href="?dataset=sentinel-west">Sentinel-2 55GCP (west coast, mostly ocean)</a> &middot;
       <a href="?dataset=gebco">GEBCO 2026 (geographic, gridlook-ready)</a>
     </p>
+
+    <form id="cog-form">
+      <input id="url" name="url" type="url" required
+        placeholder="https://.../any-cors-enabled-cog.tif" spellcheck="false" />
+      <select id="layout" name="layout" title="Zarr layout to synthesize">
+        <option value="multiscales">multiscales (any CRS)</option>
+        <option value="gridlook">GeoZarr lat/lon (geographic only)</option>
+      </select>
+      <button type="submit">Virtualize</button>
+    </form>
+    <p class="hint">
+      Any tiled, single-band COG on a CORS-enabled host. Only IFD headers are read
+      to build the references; the preview then reads the coarsest overview through them.
+    </p>
+
     <p>Status: <span id="status" class="status">Initializing&hellip;</span></p>
 
     <h2>Virtualized store metadata</h2>
     <pre id="output">Loading headers&hellip;</pre>
+    <div id="downloads"></div>
 
     <h2>Preview (coarsest overview, read through zarrita)</h2>
+    <div class="controls">
+      <label>low % <input id="lo" type="number" min="0" max="100" step="0.5" value="2" /></label>
+      <label>high % <input id="hi" type="number" min="0" max="100" step="0.5" value="98" /></label>
+      <label><input id="zero" type="checkbox" checked /> treat 0 as nodata</label>
+      <span id="range" class="hint"></span>
+    </div>
     <canvas id="preview" width="675" height="337"></canvas>
 
     <script type="module" src="/src/main.ts"></script>

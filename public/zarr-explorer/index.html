@@ -1,0 +1,850 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>virtualized: Zarr explorer</title>
+<style>
+  :root {
+    --bg: #0f1418; --panel: #172026; --line: #2a3640; --fg: #e3e9ee; --dim: #8fa1ad;
+    --acc: #5ec4b6; --warn: #e8a65a; --bad: #e46b6b;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font-size: 14px; }
+  header { padding: 10px 12px 6px; border-bottom: 1px solid var(--line); }
+  h1 { font-size: 16px; margin: 0 0 6px; font-weight: 600; }
+  h1 small { color: var(--dim); font-weight: 400; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  select, button, input[type=text], textarea {
+    background: var(--panel); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 8px; font: inherit;
+  }
+  button { cursor: pointer; }
+  #store { flex: 1 1 100%; min-width: 0; }
+  #var { flex: 1 1 auto; min-width: 0; max-width: 60%; }
+  button.on { border-color: var(--acc); color: var(--acc); }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { color: var(--dim); font-size: 12px; margin-top: 6px; min-height: 16px; font-family: ui-monospace, monospace; }
+  #banner { display: none; margin: 8px 12px 0; padding: 8px 10px; border-radius: 6px;
+    background: #3a2b18; color: #f3d2a6; border: 1px solid #6a4c25; font-size: 13px; }
+  main { padding: 8px 12px 40px; }
+  #stage { position: relative; width: 100%; background: #0a0d10; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; touch-action: manipulation; }
+  #cv { width: 100%; display: block; image-rendering: pixelated; }
+  #legend { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--dim); margin: 6px 0; flex-wrap: wrap; }
+  #legend canvas { width: 160px; height: 10px; border-radius: 2px; }
+  .slider { display: grid; grid-template-columns: 90px 1fr 150px; gap: 8px; align-items: center; margin: 6px 0; }
+  .slider label { color: var(--dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
+  .slider output { font-family: ui-monospace, monospace; font-size: 12px; text-align: right; }
+  input[type=range] { width: 100%; }
+  .tabs { display: flex; gap: 4px; margin-top: 10px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .tabs button { border-radius: 6px 6px 0 0; border-bottom: none; }
+  .tab { display: none; padding: 10px 0; }
+  .tab.show { display: block; }
+  pre, code, .mono { font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; font-size: 12px; }
+  pre { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; margin: 6px 0; }
+  table { border-collapse: collapse; font-size: 12px; width: 100%; }
+  th, td { text-align: left; padding: 3px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--dim); font-weight: 500; }
+  td.num { text-align: right; font-family: ui-monospace, monospace; }
+  .kv td:first-child { color: var(--dim); width: 34%; }
+  textarea { width: 100%; min-height: 110px; font-family: ui-monospace, monospace; font-size: 12px; }
+  .note { color: var(--dim); font-size: 12px; margin: 6px 0; }
+  .chart { width: 100%; height: 140px; display: block; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+  #sqlout { max-height: 380px; overflow: auto; margin-top: 8px; }
+  a { color: var(--acc); }
+  .pill { display: inline-block; padding: 1px 6px; border-radius: 9px; background: var(--panel); border: 1px solid var(--line); font-size: 11px; color: var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <h1>virtualized <small>: a Zarr explorer over kerchunk Parquet refs, all in the browser</small></h1>
+  <div class="row">
+    <select id="store" title="reference store"></select>
+    <select id="var" title="variable"></select>
+    <button id="mBytes" class="on" title="colour chunks by compressed byte size, from the index alone">bytes</button>
+    <button id="mVals" title="fetch referenced byte ranges from THREDDS and decode">values</button>
+  </div>
+  <div id="status">starting...</div>
+</header>
+<div id="banner"></div>
+<main>
+  <div id="stage"><canvas id="cv" width="12" height="5"></canvas></div>
+  <div id="legend"></div>
+  <div id="sliders"></div>
+
+  <div class="tabs">
+    <button data-tab="tChunk" class="on">chunk</button>
+    <button data-tab="tProfile">profiles</button>
+    <button data-tab="tSql">SQL</button>
+    <button data-tab="tMeta">metadata</button>
+    <button data-tab="tAbout">about</button>
+  </div>
+
+  <div id="tChunk" class="tab show">
+    <div class="note">Tap a chunk on the map. Each chunk is one row in a refs.N.parq file: a URL, a byte offset and a length.</div>
+    <div id="chunkInfo"></div>
+  </div>
+
+  <div id="tProfile" class="tab">
+    <div id="profA"></div>
+    <canvas id="chartA" class="chart" width="800" height="140"></canvas>
+    <div class="note" id="profANote"></div>
+    <div style="margin-top:14px" id="profB"></div>
+    <div class="row"><button id="scanTime">scan bytes through time</button><span class="note" id="scanNote"></span></div>
+    <canvas id="chartB" class="chart" width="800" height="140" style="margin-top:6px"></canvas>
+    <div class="note" id="profBNote"></div>
+  </div>
+
+  <div id="tSql" class="tab">
+    <div class="note">
+      Views: <code>refs_here</code> is the refs file(s) for the slice on screen (cheap);
+      <code>refs</code> is every refs file for this variable (a scan downloads them all).
+      Both have <code>i</code> (flat chunk index), one <code>*_c</code> chunk coordinate per dimension, <code>path</code>, <code>offset</code>, <code>size</code>.
+    </div>
+    <div class="row" id="presets"></div>
+    <textarea id="sql" spellcheck="false"></textarea>
+    <div class="row"><button id="runSql">run</button><span class="note" id="sqlNote"></span></div>
+    <div id="sqlout"></div>
+  </div>
+
+  <div id="tMeta" class="tab"><div id="meta"></div></div>
+
+  <div id="tAbout" class="tab">
+    <p class="note">
+      This page reads the reference stores in
+      <a href="https://github.com/mdsumner/virtualized">mdsumner/virtualized</a>:
+      BRAN2023 daily fields from 180-192 monthly netCDF files on NCI THREDDS, indexed as kerchunk Parquet.
+      <code>remote/*.parq</code> stores were made by VirtualiZarr (Python) on NCI;
+      <code>zarr/*.zarr</code> stores were made by blocklist (R, rhdf5 and GDAL multidim).
+    </p>
+    <p class="note">
+      Nothing is preprocessed for this page. It fetches <code>.zmetadata</code> as JSON and reads
+      <code>refs.N.parq</code> files on raw.githubusercontent.com with HTTP range requests: the map and profiles use
+      <a href="https://github.com/hyparam/hyparquet">hyparquet</a> (footer plus a row window), and the SQL tab loads
+      <a href="https://duckdb.org/docs/api/wasm/overview">DuckDB-Wasm</a> on first use.
+      Chunk index <code>i</code> is the C-order position in the chunk grid; it lives in file
+      <code>floor(i / record_size)</code> at row <code>i mod record_size</code>.
+    </p>
+    <p class="note">
+      <b>bytes</b> mode needs only the index: compressed chunk size is a surprisingly good picture of the field
+      (land, sea ice, fronts and noise all compress differently).
+      <b>values</b> mode fetches the referenced byte ranges from THREDDS, then undoes zlib and the HDF5 shuffle filter,
+      applies the fill value, scale_factor and add_offset, and draws the result. It only works if the data server allows
+      cross-origin range requests from the browser.
+    </p>
+  </div>
+</main>
+
+<script type="module">
+const DUCK = "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.32.0/+esm";
+const HYPARQUET = "https://cdn.jsdelivr.net/npm/hyparquet@1.31.5/+esm";
+const HYPARQUET_COMP = "https://cdn.jsdelivr.net/npm/hyparquet-compressors@1.1.2/+esm";
+const BASE = "https://raw.githubusercontent.com/mdsumner/virtualized/refs/heads/main/";
+const STORES = [
+  ["remote/ocean_temp_2023.parq", "VirtualiZarr"], ["zarr/ocean_temp.zarr", "blocklist"],
+  ["remote/ocean_salt_2023.parq", "VirtualiZarr"], ["zarr/ocean_salt.zarr", "blocklist"],
+  ["remote/ocean_u_2023.parq", "VirtualiZarr"], ["zarr/ocean_u.zarr", "blocklist"],
+  ["remote/ocean_v_2023.parq", "VirtualiZarr"], ["zarr/ocean_v.zarr", "blocklist"],
+  ["remote/ocean_w_2023.parq", "VirtualiZarr"], ["zarr/ocean_w.zarr", "blocklist"],
+  ["remote/ocean_eta_t_2023.parq", "VirtualiZarr"], ["zarr/ocean_eta_t.zarr", "blocklist"],
+  ["remote/ocean_mld_2023.parq", "VirtualiZarr"], ["zarr/ocean_mld.zarr", "blocklist"],
+  ["remote/ocean_tx_trans_int_z_2023.parq", "VirtualiZarr"], ["zarr/ocean_tx_trans_int_z.zarr", "blocklist"],
+  ["remote/ocean_ty_trans_int_z_2023.parq", "VirtualiZarr"], ["zarr/ocean_ty_trans_int_z.zarr", "blocklist"],
+  ["remote/ocean_force_2023.parq", "VirtualiZarr"], ["zarr/ocean_force.zarr", "blocklist"],
+  ["remote/atm_flux_diag_2023.parq", "VirtualiZarr"], ["remote/ice_force_2023.parq", "VirtualiZarr"],
+];
+
+const $ = (id) => document.getElementById(id);
+const S = {
+  store: null, meta: null, record: 100000, v: null, za: null, attrs: null,
+  shape: [], chunks: [], nch: [], dims: [], idx: [], coords: {},
+  mode: "bytes", slice: null, vals: null, range: null, cors: null,
+  sel: null, netBytes: 0, gen: 0,
+};
+
+/* ---------- small utilities ---------- */
+const status = (s) => { $("status").textContent = s; };
+const fmtB = (b) => b >= 1e9 ? (b / 1e9).toFixed(2) + " GB" : b >= 1e6 ? (b / 1e6).toFixed(2) + " MB" : b >= 1e3 ? (b / 1e3).toFixed(1) + " kB" : b + " B";
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const sq = (s) => "'" + String(s).replace(/'/g, "''") + "'";
+function banner(html) { const b = $("banner"); if (!html) { b.style.display = "none"; return; } b.innerHTML = html; b.style.display = "block"; }
+
+const STOPS = {
+  viridis: ["#440154", "#3b528b", "#21918c", "#5ec962", "#fde725"],
+  magma: ["#000004", "#3b0f70", "#8c2981", "#de4968", "#fe9f6d", "#fcfdbf"],
+};
+function lut(name) {
+  const st = STOPS[name].map((h) => [1, 3, 5].map((k) => parseInt(h.slice(k, k + 2), 16)));
+  const out = new Uint8Array(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const f = (i / 255) * (st.length - 1), k = Math.min(st.length - 2, Math.floor(f)), t = f - k;
+    for (let c = 0; c < 3; c++) out[i * 3 + c] = Math.round(st[k][c] + (st[k + 1][c] - st[k][c]) * t);
+  }
+  return out;
+}
+const LUT = { viridis: lut("viridis"), magma: lut("magma") };
+
+function legend(name, lo, hi, label) {
+  const L = $("legend"); L.innerHTML = "";
+  const c = document.createElement("canvas"); c.width = 256; c.height = 1;
+  const g = c.getContext("2d"), im = g.createImageData(256, 1), T = LUT[name];
+  for (let i = 0; i < 256; i++) { im.data[i * 4] = T[i * 3]; im.data[i * 4 + 1] = T[i * 3 + 1]; im.data[i * 4 + 2] = T[i * 3 + 2]; im.data[i * 4 + 3] = 255; }
+  g.putImageData(im, 0, 0);
+  const a = document.createElement("span"); a.textContent = lo;
+  const b = document.createElement("span"); b.textContent = hi;
+  const t = document.createElement("span"); t.textContent = label;
+  L.append(a, c, b, t);
+}
+
+/* ---------- Parquet reads (hyparquet: footer + row windows over HTTP range) ---------- */
+let HP = null, HPC = null;
+async function initParquet() {
+  [HP, HPC] = await Promise.all([import(HYPARQUET), import(HYPARQUET_COMP)]);
+}
+const pqCache = new Map(), TD = new TextDecoder();
+function pqFile(url) {
+  if (!pqCache.has(url)) {
+    const p = (async () => {
+      const inner = HP.cachedAsyncBuffer(await HP.asyncBufferFromUrl({ url }));
+      const file = {
+        byteLength: inner.byteLength,
+        slice: async (s, e) => { const b = await inner.slice(s, e); S.netBytes += b.byteLength; return b; },
+      };
+      const metadata = await HP.parquetMetadataAsync(file);
+      return { file, metadata };
+    })();
+    p.catch(() => pqCache.delete(url));
+    pqCache.set(url, p);
+  }
+  return pqCache.get(url);
+}
+async function readRows(url, columns, a, b) {
+  // rows a..b inclusive, as objects; INT64 comes back as BigInt
+  const { file, metadata } = await pqFile(url);
+  const rows = await HP.parquetReadObjects({ file, metadata, columns, rowStart: a, rowEnd: b + 1, compressors: HPC.compressors, utf8: false });
+  for (const r of rows) {
+    for (const k of ["offset", "size"]) if (typeof r[k] === "bigint") r[k] = Number(r[k]);
+    if (r.path instanceof Uint8Array) r.path = TD.decode(r.path);
+    if (typeof r.raw === "string") r.raw = new TextEncoder().encode(r.raw);
+  }
+  return rows;
+}
+function columnBytes(meta, name) {
+  let n = 0;
+  for (const rg of meta.row_groups) for (const c of rg.columns) if (c.meta_data && c.meta_data.path_in_schema.join(".") === name) n += Number(c.meta_data.total_compressed_size);
+  return n;
+}
+
+/* ---------- DuckDB (only for the SQL tab, loaded on first use) ---------- */
+let conn = null;
+async function initDuck() {
+  if (conn) return;
+  const duckdb = await import(DUCK);
+  const bundle = await duckdb.selectBundle(duckdb.getJsDelivrBundles());
+  const wurl = URL.createObjectURL(new Blob([`importScripts("${bundle.mainWorker}");`], { type: "text/javascript" }));
+  const db = new duckdb.AsyncDuckDB(new duckdb.VoidLogger(), new Worker(wurl));
+  await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+  URL.revokeObjectURL(wurl);
+  conn = await db.connect();
+}
+async function q(sql) {
+  const t0 = performance.now();
+  const tab = await conn.query(sql);
+  const rows = tab.toArray().map((r) => r.toJSON());
+  return { rows, cols: tab.schema.fields.map((f) => f.name), ms: performance.now() - t0 };
+}
+const refsUrl = (k, v = S.v) => BASE + S.store + "/" + v + "/refs." + k + ".parq";
+
+/* ---------- metadata ---------- */
+async function getText(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(r.status + " " + url);
+  const t = await r.text(); S.netBytes += t.length; return t;
+}
+async function loadStore(store) {
+  S.store = store;
+  status("reading " + store + "/.zmetadata");
+  // kerchunk writes bare NaN / Infinity, which JSON.parse rejects
+  const txt = (await getText(BASE + store + "/.zmetadata")).replace(/\bNaN\b/g, "null").replace(/-?\bInfinity\b/g, "null");
+  const j = JSON.parse(txt);
+  S.meta = j.metadata; S.record = j.record_size || 100000;
+  const vars = Object.keys(S.meta).filter((k) => k.endsWith("/.zarray")).map((k) => k.slice(0, -8));
+  const dataVars = vars.filter((v) => S.meta[v + "/.zarray"].shape.length >= 2 && !/_bnds$|_bounds$/.test(v));
+  dataVars.sort((a, b) => S.meta[b + "/.zarray"].shape.length - S.meta[a + "/.zarray"].shape.length);
+  const sel = $("var"); sel.innerHTML = "";
+  for (const v of dataVars) {
+    const o = document.createElement("option"); o.value = v;
+    const za = S.meta[v + "/.zarray"]; o.textContent = v + " [" + za.shape.join(" x ") + "]"; sel.append(o);
+  }
+  return dataVars;
+}
+
+/* ---------- codecs ---------- */
+async function inflate(buf, fmt) {
+  const ds = new DecompressionStream(fmt);
+  const out = new Response(new Blob([buf]).stream().pipeThrough(ds));
+  return new Uint8Array(await out.arrayBuffer());
+}
+function unshuffle(b, e) {
+  if (e <= 1) return b;
+  const n = Math.floor(b.length / e), out = new Uint8Array(b.length);
+  for (let k = 0; k < e; k++) { const off = k * n; for (let i = 0; i < n; i++) out[i * e + k] = b[off + i]; }
+  out.set(b.subarray(n * e), n * e);
+  return out;
+}
+async function decodeBytes(buf, za) {
+  let b = new Uint8Array(buf);
+  const steps = [];
+  for (const f of za.filters || []) steps.push(f);
+  if (za.compressor) steps.push(za.compressor);
+  // encode order is filters then compressor; decode runs it backwards
+  for (const c of steps.reverse()) {
+    if (c.id === "zlib") b = await inflate(b, "deflate");
+    else if (c.id === "gzip") b = await inflate(b, "gzip");
+    else if (c.id === "shuffle") b = unshuffle(b, c.elementsize || dtypeSize(za.dtype));
+    else throw new Error("codec not supported here: " + c.id);
+  }
+  return toTyped(b, za.dtype);
+}
+function dtypeSize(dt) { return parseInt(dt.slice(2), 10); }
+function toTyped(b, dt) {
+  const kind = dt[1], n = dtypeSize(dt), big = dt[0] === ">";
+  const C = { "i1": Int8Array, "u1": Uint8Array, "i2": Int16Array, "u2": Uint16Array, "i4": Int32Array, "u4": Uint32Array, "f4": Float32Array, "f8": Float64Array, "i8": BigInt64Array, "u8": BigUint64Array }[kind + n];
+  if (!C) throw new Error("dtype not supported: " + dt);
+  const len = Math.floor(b.length / n);
+  if (!big || n === 1) { const c = new Uint8Array(len * n); c.set(b.subarray(0, len * n)); return new C(c.buffer); }
+  const out = new C(len), dv = new DataView(b.buffer, b.byteOffset, len * n);
+  const get = { "i2": "getInt16", "u2": "getUint16", "i4": "getInt32", "u4": "getUint32", "f4": "getFloat32", "f8": "getFloat64", "i8": "getBigInt64", "u8": "getBigUint64" }[kind + n];
+  for (let i = 0; i < len; i++) out[i] = dv[get](i * n, false);
+  return out;
+}
+
+/* ---------- coordinates ---------- */
+async function loadCoord(name) {
+  const za = S.meta[name + "/.zarray"];
+  if (!za || za.shape.length !== 1) return null;
+  const nfile = Math.ceil(Math.ceil(za.shape[0] / za.chunks[0]) / S.record);
+  if (nfile !== 1) return null;
+  const rows = await readRows(refsUrl(0, name), ["path", "offset", "size", "raw"], 0, Math.ceil(za.shape[0] / za.chunks[0]) - 1);
+  const parts = [];
+  for (const r of rows) {
+    let buf;
+    if (r.raw && r.raw.length) buf = r.raw;
+    else if (r.path) buf = new Uint8Array(await rangeGet(r.path, r.offset, r.size));
+    else return null;
+    parts.push(await decodeBytes(buf, za));
+  }
+  const out = new Float64Array(za.shape[0]); let k = 0;
+  for (const p of parts) for (let i = 0; i < p.length && k < out.length; i++) out[k++] = Number(p[i]);
+  return out;
+}
+function coordLabel(d, i) {
+  const name = S.dims[d], c = S.coords[name];
+  if (!c) return "#" + i;
+  const v = c[i], at = S.meta[name + "/.zattrs"] || {}, u = at.units || "";
+  const m = /^(\w+) since (\d{4}-\d{1,2}-\d{1,2})(?:[ T](\d{1,2}:\d{2}(?::\d{2})?))?/.exec(u);
+  if (m) {
+    const ms = { days: 864e5, hours: 36e5, minutes: 6e4, seconds: 1e3 }[m[1]] || 864e5;
+    const [y, mo, da] = m[2].split("-").map(Number);
+    const t0 = Date.UTC(y, mo - 1, da);
+    return new Date(t0 + v * ms).toISOString().slice(0, 10);
+  }
+  return (Math.abs(v) < 1000 ? v.toFixed(2) : v.toFixed(0)) + (u ? " " + u : "");
+}
+
+/* ---------- grid arithmetic ---------- */
+function chunkStrides() {
+  const st = new Array(S.nch.length); let s = 1;
+  for (let d = S.nch.length - 1; d >= 0; d--) { st[d] = s; s *= S.nch[d]; }
+  return st;
+}
+function flatChunk(cidx) { const st = chunkStrides(); let i = 0; for (let d = 0; d < cidx.length; d++) i += cidx[d] * st[d]; return i; }
+function sliceRange() {
+  const nd = S.dims.length, cidx = S.idx.map((v, d) => Math.floor(v / S.chunks[d]));
+  cidx[nd - 2] = 0; cidx[nd - 1] = 0;
+  const lo = flatChunk(cidx), hi = lo + S.nch[nd - 2] * S.nch[nd - 1] - 1;
+  return { lo, hi, cidx };
+}
+
+/* ---------- variable setup ---------- */
+async function loadVar(v) {
+  const gen = ++S.gen;
+  S.v = v; S.za = S.meta[v + "/.zarray"]; S.attrs = S.meta[v + "/.zattrs"] || {};
+  S.shape = S.za.shape; S.chunks = S.za.chunks;
+  S.nch = S.shape.map((n, d) => Math.ceil(n / S.chunks[d]));
+  S.dims = S.attrs._ARRAY_DIMENSIONS || S.shape.map((_, d) => "dim_" + d);
+  S.idx = S.shape.map(() => 0);
+  S.vals = null; S.sel = null; S.slice = null;
+  const h = parseHash();
+  if (h.idx && h.store === S.store && h.var === v) h.idx.forEach((x, d) => { if (d < S.idx.length) S.idx[d] = Math.max(0, Math.min(S.shape[d] - 1, x)); });
+  status("reading coordinates");
+  S.coords = {};
+  for (const d of S.dims) {
+    try { const c = await loadCoord(d); if (c) S.coords[d] = c; } catch (e) { /* labels fall back to indices */ }
+    if (gen !== S.gen) return;
+  }
+  buildSliders(); renderMeta(); buildPresets(); $("chunkInfo").innerHTML = "";
+  $("chartB").getContext("2d").clearRect(0, 0, 800, 140); $("profBNote").textContent = ""; $("scanNote").textContent = ""; estimateScan();
+  await refresh();
+}
+
+function buildSliders() {
+  const box = $("sliders"); box.innerHTML = "";
+  const nd = S.dims.length;
+  for (let d = 0; d < nd - 2; d++) {
+    const row = document.createElement("div"); row.className = "slider";
+    const lab = document.createElement("label"); lab.textContent = S.dims[d] + " (" + S.shape[d] + ")";
+    const r = document.createElement("input"); r.type = "range"; r.min = 0; r.max = S.shape[d] - 1; r.value = S.idx[d];
+    const out = document.createElement("output"); out.textContent = coordLabel(d, S.idx[d]);
+    let timer = null;
+    r.addEventListener("input", () => {
+      S.idx[d] = +r.value; out.textContent = coordLabel(d, S.idx[d]);
+      clearTimeout(timer); timer = setTimeout(refresh, 250);
+    });
+    row.append(lab, r, out); box.append(row);
+  }
+}
+
+/* ---------- the slice ---------- */
+async function loadSliceRefs() {
+  const { lo, hi } = sliceRange(), R = S.record;
+  const k0 = Math.floor(lo / R), k1 = Math.floor(hi / R);
+  const t0 = performance.now();
+  const nx = S.nch[S.nch.length - 1], ny = S.nch[S.nch.length - 2];
+  const refs = new Array(nx * ny).fill(null);
+  await Promise.all(Array.from({ length: k1 - k0 + 1 }, async (_, j) => {
+    const k = k0 + j;
+    const a = Math.max(lo, k * R) - k * R, b = Math.min(hi, k * R + R - 1) - k * R;
+    const rows = await readRows(refsUrl(k), ["path", "offset", "size", "raw"], a, b);
+    rows.forEach((r, n) => {
+      const raw = r.raw && r.raw.length ? r.raw : null;
+      refs[k * R + a + n - lo] = { path: r.path, o: r.offset, s: r.size, raw };
+    });
+  }));
+  return { lo, hi, k0, k1, refs, nx, ny, ms: performance.now() - t0 };
+}
+
+async function refresh() {
+  const gen = S.gen;
+  writeHash();
+  status("querying refs for slice...");
+  try {
+    const sl = await loadSliceRefs();
+    if (gen !== S.gen) return;
+    S.slice = sl; S.vals = null;
+    const tot = sl.refs.reduce((a, r) => a + (r && r.path ? r.s : 0), 0);
+    status(`${sl.refs.length} chunks, ${fmtB(tot)} referenced; refs.${sl.k0}${sl.k1 > sl.k0 ? "-" + sl.k1 : ""}.parq read in ${sl.ms.toFixed(0)} ms; ${fmtB(S.netBytes)} fetched this session`);
+    if (S.mode === "values") await loadValues(); else drawBytes();
+    if (S.sel) showChunk(S.sel[0], S.sel[1]);
+    profileA();
+  } catch (e) {
+    status("error: " + e.message); console.error(e);
+  }
+}
+
+function spatialGeom() {
+  const nd = S.dims.length, H = S.shape[nd - 2], W = S.shape[nd - 1];
+  const yc = S.coords[S.dims[nd - 2]];
+  const flip = yc ? yc[0] < yc[yc.length - 1] : false; // north up
+  return { H, W, flip, cy: S.chunks[nd - 2], cx: S.chunks[nd - 1] };
+}
+function sizeCanvas(W, H) {
+  const cv = $("cv");
+  // keep values at full resolution; cap really large grids
+  const sc = Math.min(1, 4096 / Math.max(W, H));
+  cv.width = Math.max(1, Math.round(W * sc)); cv.height = Math.max(1, Math.round(H * sc));
+  return sc;
+}
+
+function drawBytes() {
+  const sl = S.slice, g = spatialGeom(), cv = $("cv"), ctx = cv.getContext("2d");
+  const sc = sizeCanvas(g.W, g.H);
+  const sizes = sl.refs.filter((r) => r && r.path).map((r) => r.s);
+  const lo = Math.log(Math.max(1, Math.min(...sizes))), hi = Math.log(Math.max(...sizes));
+  ctx.fillStyle = "#0a0d10"; ctx.fillRect(0, 0, cv.width, cv.height);
+  const T = LUT.magma;
+  for (let cyI = 0; cyI < sl.ny; cyI++) for (let cxI = 0; cxI < sl.nx; cxI++) {
+    const r = sl.refs[cyI * sl.nx + cxI];
+    const y0 = cyI * g.cy, y1 = Math.min(g.H, y0 + g.cy), x0 = cxI * g.cx, x1 = Math.min(g.W, x0 + g.cx);
+    const py0 = g.flip ? g.H - y1 : y0;
+    if (!r || !r.path) { ctx.fillStyle = r && r.raw ? "#335" : "#222"; }
+    else {
+      const t = hi > lo ? (Math.log(r.s) - lo) / (hi - lo) : 0.5, k = Math.round(t * 255) * 3;
+      ctx.fillStyle = `rgb(${T[k]},${T[k + 1]},${T[k + 2]})`;
+    }
+    ctx.fillRect(x0 * sc, py0 * sc, (x1 - x0) * sc, (y1 - y0) * sc);
+  }
+  ctx.strokeStyle = "rgba(255,255,255,.18)"; ctx.lineWidth = 1;
+  for (let i = 0; i <= sl.nx; i++) { const x = Math.min(g.W, i * g.cx) * sc; ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, cv.height); ctx.stroke(); }
+  for (let j = 0; j <= sl.ny; j++) { const y = Math.min(g.H, j * g.cy) * sc; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(cv.width, y); ctx.stroke(); }
+  drawSel();
+  legend("magma", fmtB(Math.round(Math.exp(lo))), fmtB(Math.round(Math.exp(hi))), "compressed bytes per chunk (log)");
+}
+
+function drawSel() {
+  if (!S.sel) return;
+  const g = spatialGeom(), cv = $("cv"), ctx = cv.getContext("2d"), sc = cv.width / g.W;
+  const [cyI, cxI] = S.sel;
+  const y0 = cyI * g.cy, y1 = Math.min(g.H, y0 + g.cy), x0 = cxI * g.cx, x1 = Math.min(g.W, x0 + g.cx);
+  const py0 = g.flip ? g.H - y1 : y0;
+  ctx.strokeStyle = "#5ec4b6"; ctx.lineWidth = Math.max(2, 3 * sc);
+  ctx.strokeRect(x0 * sc, py0 * sc, (x1 - x0) * sc, (y1 - y0) * sc);
+}
+
+/* ---------- values ---------- */
+async function rangeGet(url, off, len) {
+  const r = await fetch(url, { headers: { Range: `bytes=${off}-${off + len - 1}` } });
+  if (!(r.status === 206 || r.status === 200)) throw new Error("HTTP " + r.status);
+  const b = await r.arrayBuffer();
+  S.netBytes += b.byteLength;
+  return r.status === 200 && b.byteLength > len ? b.slice(off, off + len) : b;
+}
+function unpackInfo() {
+  const a = S.attrs, za = S.za;
+  const fills = [za.fill_value, a._FillValue, a.missing_value].filter((x) => x !== null && x !== undefined && x !== "NaN").map(Number);
+  const scale = a.scale_factor == null ? 1 : +a.scale_factor, off = a.add_offset == null ? 0 : +a.add_offset;
+  return { fills, scale, off };
+}
+function innerOffset() {
+  // position of the current non-spatial indices inside a chunk
+  const nd = S.dims.length; let o = 0, s = 1;
+  const local = S.idx.map((v, d) => v % S.chunks[d]);
+  for (let d = nd - 1; d >= 0; d--) { if (d < nd - 2) o += local[d] * s; s *= S.chunks[d]; }
+  return o;
+}
+
+async function loadValues() {
+  const gen = S.gen, sl = S.slice, g = spatialGeom();
+  const vals = new Float32Array(g.W * g.H).fill(NaN);
+  S.vals = vals;
+  const U = unpackInfo(), inner = innerOffset();
+  const todo = sl.refs.map((r, k) => [r, k]).filter(([r]) => r && (r.path || r.raw));
+  let done = 0, failed = 0, bytes = 0, firstErr = null;
+  const t0 = performance.now();
+  const work = async () => {
+    while (todo.length) {
+      const [r, k] = todo.shift();
+      if (gen !== S.gen || S.vals !== vals) return;
+      try {
+        const buf = r.raw ? r.raw : await rangeGet(r.path, r.o, r.s);
+        bytes += buf.byteLength;
+        const arr = await decodeBytes(buf, S.za);
+        const cyI = Math.floor(k / sl.nx), cxI = k % sl.nx;
+        const y0 = cyI * g.cy, x0 = cxI * g.cx;
+        for (let yy = 0; yy < g.cy && y0 + yy < g.H; yy++) for (let xx = 0; xx < g.cx && x0 + xx < g.W; xx++) {
+          let v = Number(arr[inner + yy * g.cx + xx]);
+          if (U.fills.includes(v)) v = NaN; else v = v * U.scale + U.off;
+          vals[(y0 + yy) * g.W + x0 + xx] = v;
+        }
+        S.cors = true;
+      } catch (e) {
+        failed++; if (!firstErr) firstErr = e;
+      }
+      done++;
+      if (done % 6 === 0 || done === sl.refs.length) { drawValues(false); status(`values: ${done}/${sl.refs.length} chunks, ${fmtB(bytes)} fetched, ${failed} failed`); }
+    }
+  };
+  status("fetching chunk bytes from " + (todo[0] && todo[0][0].path ? new URL(todo[0][0].path).host : "store") + "...");
+  await Promise.all(Array.from({ length: 8 }, work));
+  if (gen !== S.gen || S.vals !== vals) return;
+  if (failed && failed === done) {
+    S.cors = false; S.vals = null;
+    banner(`<b>The data server did not let the browser read the chunk bytes.</b> ${esc(firstErr && firstErr.message || "")}
+      Most likely it does not send CORS headers for range requests.
+      The index views (bytes, chunk, profiles, SQL) still work; to check the bytes yourself, use the curl line in the chunk tab.`);
+    setMode("bytes");
+    return;
+  }
+  banner(null);
+  drawValues(true);
+  status(`values: ${done - failed}/${sl.refs.length} chunks decoded, ${fmtB(bytes)} fetched in ${((performance.now() - t0) / 1000).toFixed(1)} s` + (failed ? `, ${failed} failed` : ""));
+}
+
+function drawValues(final) {
+  const vals = S.vals; if (!vals) return;
+  const g = spatialGeom(), cv = $("cv");
+  sizeCanvas(g.W, g.H);
+  if (final || !S.range) {
+    const smp = [];
+    const step = Math.max(1, Math.floor(vals.length / 200000));
+    for (let i = 0; i < vals.length; i += step) if (Number.isFinite(vals[i])) smp.push(vals[i]);
+    if (smp.length) { smp.sort((a, b) => a - b); S.range = [smp[Math.floor(smp.length * 0.01)], smp[Math.floor(smp.length * 0.99)]]; }
+  }
+  const [lo, hi] = S.range || [0, 1];
+  const W = g.W, H = g.H;
+  const full = document.createElement("canvas"); full.width = W; full.height = H;
+  const fctx = full.getContext("2d"), im = fctx.createImageData(W, H), T = LUT.viridis, d = im.data;
+  for (let y = 0; y < H; y++) {
+    const yy = g.flip ? H - 1 - y : y;
+    for (let x = 0; x < W; x++) {
+      const v = vals[yy * W + x], p = (y * W + x) * 4;
+      if (!Number.isFinite(v)) { d[p] = 26; d[p + 1] = 30; d[p + 2] = 34; d[p + 3] = 255; continue; }
+      let t = (v - lo) / (hi - lo); t = t < 0 ? 0 : t > 1 ? 1 : t;
+      const k = Math.round(t * 255) * 3; d[p] = T[k]; d[p + 1] = T[k + 1]; d[p + 2] = T[k + 2]; d[p + 3] = 255;
+    }
+  }
+  fctx.putImageData(im, 0, 0);
+  const ctx = cv.getContext("2d"); ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(full, 0, 0, cv.width, cv.height);
+  drawSel();
+  const u = S.attrs.units || "";
+  legend("viridis", lo.toPrecision(4), hi.toPrecision(4), (S.attrs.long_name || S.v) + (u ? " (" + u + ")" : "") + ", 1-99%");
+}
+
+function setMode(m) {
+  S.mode = m;
+  $("mBytes").classList.toggle("on", m === "bytes"); $("mVals").classList.toggle("on", m === "values");
+  if (!S.slice) return;
+  if (m === "values") { S.range = null; loadValues(); } else drawBytes();
+}
+
+/* ---------- tap a chunk ---------- */
+$("cv").addEventListener("click", (ev) => {
+  if (!S.slice) return;
+  const g = spatialGeom(), r = ev.target.getBoundingClientRect();
+  const fx = (ev.clientX - r.left) / r.width, fy = (ev.clientY - r.top) / r.height;
+  const col = Math.min(g.W - 1, Math.floor(fx * g.W));
+  let row = Math.min(g.H - 1, Math.floor(fy * g.H)); if (g.flip) row = g.H - 1 - row;
+  S.sel = [Math.floor(row / g.cy), Math.floor(col / g.cx)];
+  S.pick = [row, col];
+  if (S.mode === "values" && S.vals) drawValues(false); else drawBytes();
+  showChunk(S.sel[0], S.sel[1]);
+  showTab("tChunk");
+});
+
+function showChunk(cyI, cxI) {
+  const sl = S.slice, k = cyI * sl.nx + cxI, ref = sl.refs[k], i = sl.lo + k, R = S.record;
+  const nd = S.dims.length, cidx = sliceRange().cidx; cidx[nd - 2] = cyI; cidx[nd - 1] = cxI;
+  const rows = [];
+  rows.push(["chunk", "(" + cidx.join(", ") + ")  of grid (" + S.nch.join(", ") + ")"]);
+  rows.push(["flat index i", i.toLocaleString("en")]);
+  rows.push(["refs file / row", `refs.${Math.floor(i / R)}.parq  row ${i % R}`]);
+  if (ref && ref.path) {
+    rows.push(["path", `<a href="${esc(ref.path)}">${esc(ref.path)}</a>`]);
+    rows.push(["offset", ref.o.toLocaleString("en")]);
+    rows.push(["size", ref.s.toLocaleString("en") + " bytes (" + fmtB(ref.s) + ")"]);
+    const raw = S.chunks.reduce((a, b) => a * b, 1) * dtypeSize(S.za.dtype);
+    rows.push(["compression", (raw / ref.s).toFixed(2) + " : 1 (" + fmtB(raw) + " decoded)"]);
+  } else rows.push(["ref", ref && ref.raw ? "inline bytes" : "no reference (missing chunk)"]);
+  if (S.pick && S.vals) {
+    const g = spatialGeom(), v = S.vals[S.pick[0] * g.W + S.pick[1]];
+    const xn = S.dims[nd - 1], yn = S.dims[nd - 2];
+    const xl = S.coords[xn] ? S.coords[xn][S.pick[1]].toFixed(3) : S.pick[1], yl = S.coords[yn] ? S.coords[yn][S.pick[0]].toFixed(3) : S.pick[0];
+    rows.push(["value at tap", (Number.isFinite(v) ? v.toPrecision(5) : "NA") + `  at ${xn}=${xl}, ${yn}=${yl}`]);
+  }
+  let html = '<table class="kv">' + rows.map(([a, b]) => `<tr><td>${a}</td><td class="mono">${b}</td></tr>`).join("") + "</table>";
+  if (ref && ref.path) {
+    const curl = `curl -s -r ${ref.o}-${ref.o + ref.s - 1} "${ref.path}" -o chunk.bin`;
+    const sql = `select path, "offset", size\nfrom read_parquet('${refsUrl(Math.floor(i / R))}', file_row_number = true)\nwhere file_row_number = ${i % R};`;
+    const gd = gdalLine(cidx);
+    html += `<div class="note">the bytes, by hand:</div><pre>${esc(curl)}</pre>`;
+    html += `<div class="note">the same row, by SQL:</div><pre>${esc(sql)}</pre>`;
+    html += `<div class="note">the same slice, by GDAL (multidim, through the whole store):</div><pre>${esc(gd)}</pre>`;
+    html += `<div class="row"><button id="cpCurl">copy curl</button><button id="cpGdal">copy GDAL</button></div>`;
+  }
+  $("chunkInfo").innerHTML = html;
+  const cp = (id, txt) => { const b = $(id); if (b) b.onclick = async () => { try { await navigator.clipboard.writeText(txt); b.textContent = "copied"; } catch (e) { b.textContent = "copy failed"; } }; };
+  if (ref && ref.path) { cp("cpCurl", `curl -s -r ${ref.o}-${ref.o + ref.s - 1} "${ref.path}" -o chunk.bin`); cp("cpGdal", gdalLine(cidx)); }
+}
+function gdalLine(cidx) {
+  const nd = S.dims.length;
+  const sub = S.dims.map((d, k) => k < nd - 2 ? String(S.idx[k]) : `${cidx[k] * S.chunks[k]}:${Math.min(S.shape[k], (cidx[k] + 1) * S.chunks[k])}`).join(",");
+  return `gdal mdim convert --array=${S.v} --subset-view="[${sub}]" "/vsicurl/${BASE}${S.store}" chunk.tif`;
+}
+
+/* ---------- profiles ---------- */
+function barChart(id, values, labels, cur, onPick, color) {
+  const cv = $(id), w = cv.clientWidth || 800; cv.width = w * (window.devicePixelRatio || 1); cv.height = 140 * (window.devicePixelRatio || 1);
+  const ctx = cv.getContext("2d"), W = cv.width, H = cv.height, pad = 18 * (window.devicePixelRatio || 1);
+  ctx.clearRect(0, 0, W, H);
+  const mx = Math.max(...values.filter(Number.isFinite), 1), n = values.length, bw = (W - 2) / n;
+  for (let i = 0; i < n; i++) {
+    const h = Number.isFinite(values[i]) ? (values[i] / mx) * (H - pad - 4) : 0;
+    ctx.fillStyle = i === cur ? "#5ec4b6" : color; ctx.fillRect(1 + i * bw, H - pad - h, Math.max(1, bw - (bw > 3 ? 1 : 0)), h);
+  }
+  ctx.fillStyle = "#8fa1ad"; ctx.font = `${11 * (window.devicePixelRatio || 1)}px system-ui`;
+  ctx.fillText(labels[0], 2, H - 4); const lt = labels[n - 1]; ctx.fillText(lt, W - ctx.measureText(lt).width - 2, H - 4);
+  ctx.fillText(fmtB(Math.round(mx)), 4, 14 * (window.devicePixelRatio || 1));
+  cv.onclick = (ev) => { const r = cv.getBoundingClientRect(); const i = Math.min(n - 1, Math.floor((ev.clientX - r.left) / r.width * n)); onPick(i); };
+}
+
+async function profileA() {
+  // bytes per index of the dimension just before the spatial pair, for the current position in the others
+  const nd = S.dims.length;
+  if (nd < 4) { $("profA").innerHTML = ""; $("chartA").style.display = "none"; $("profANote").textContent = ""; return; }
+  $("chartA").style.display = "block";
+  const d = nd - 3, gen = S.gen;
+  const cidx = S.idx.map((v, k) => Math.floor(v / S.chunks[k])); cidx[d] = 0; cidx[nd - 2] = 0; cidx[nd - 1] = 0;
+  const per = S.nch[nd - 2] * S.nch[nd - 1], lo = flatChunk(cidx), hi = lo + S.nch[d] * per - 1, R = S.record;
+  $("profA").innerHTML = `<b>bytes per ${esc(S.dims[d])}</b> <span class="pill">${esc(S.dims[0])} = ${esc(coordLabel(0, S.idx[0]))}</span>`;
+  try {
+    const t0 = performance.now();
+    const vals = new Array(S.nch[d]).fill(0); let nrow = 0;
+    for (let k = Math.floor(lo / R); k <= Math.floor(hi / R); k++) {
+      const a = Math.max(lo, k * R) - k * R, b = Math.min(hi, k * R + R - 1) - k * R;
+      const rows = await readRows(refsUrl(k), ["size"], a, b);
+      rows.forEach((r, n) => { vals[Math.floor((k * R + a + n - lo) / per)] += r.size || 0; });
+      nrow += rows.length;
+    }
+    if (gen !== S.gen) return;
+    const res = { rows: { length: nrow }, ms: performance.now() - t0 };
+    const labs = vals.map((_, c) => coordLabel(d, Math.min(S.shape[d] - 1, c * S.chunks[d])));
+    barChart("chartA", vals, labs, Math.floor(S.idx[d] / S.chunks[d]), (c) => { S.idx[d] = c * S.chunks[d]; buildSliders(); refresh(); }, "#7d5aa6");
+    $("profANote").textContent = `Total compressed bytes of each ${S.dims[d]} slab, summed from ${res.rows.length} refs rows in ${res.ms.toFixed(0)} ms. Tap a bar to go there. Fewer bytes usually means more land (fill) or smoother fields.`;
+  } catch (e) { $("profANote").textContent = "profile failed: " + e.message; }
+}
+
+async function estimateScan() {
+  const total = S.nch.reduce((a, b) => a * b, 1), nf = Math.ceil(total / S.record);
+  let est = "";
+  try { const { metadata } = await pqFile(refsUrl(0)); est = ", about " + fmtB(columnBytes(metadata, "size") * nf); } catch (e) { /* estimate optional */ }
+  $("scanNote").textContent = `reads the size column of all ${nf} refs file${nf > 1 ? "s" : ""}${est}`;
+}
+$("scanTime").onclick = async () => {
+  const gen = S.gen, total = S.nch.reduce((a, b) => a * b, 1), nf = Math.ceil(total / S.record), per = total / S.nch[0], R = S.record;
+  $("scanTime").disabled = true; $("profBNote").textContent = "scanning " + nf + " files...";
+  try {
+    const t0 = performance.now(), b0 = S.netBytes;
+    const vals = new Array(S.nch[0]).fill(0);
+    const ks = Array.from({ length: nf }, (_, k) => k); let done = 0;
+    const work = async () => {
+      while (ks.length) {
+        const k = ks.shift(); if (gen !== S.gen) return;
+        const { metadata } = await pqFile(refsUrl(k));
+        const n = Number(metadata.num_rows);
+        const rows = await readRows(refsUrl(k), ["size"], 0, n - 1);
+        rows.forEach((r, j) => { const t = Math.floor((k * R + j) / per); if (t < vals.length) vals[t] += r.size || 0; });
+        done++; $("profBNote").textContent = `scanning: ${done}/${nf} files, ${fmtB(S.netBytes - b0)}`;
+      }
+    };
+    await Promise.all(Array.from({ length: 4 }, work));
+    if (gen !== S.gen) return;
+    const res = { rows: { length: vals.length }, ms: performance.now() - t0 };
+    const labs = vals.map((_, c) => coordLabel(0, Math.min(S.shape[0] - 1, c * S.chunks[0])));
+    barChart("chartB", vals, labs, Math.floor(S.idx[0] / S.chunks[0]), (c) => { S.idx[0] = c * S.chunks[0]; buildSliders(); refresh(); }, "#b0643c");
+    $("profBNote").textContent = `Total compressed bytes per ${S.dims[0]} step across the whole store (${res.rows.length} steps, ${nf} files, ${(res.ms / 1000).toFixed(1)} s). Tap to jump. Seasonal cycles and gaps show up here without reading a single data byte.`;
+  } catch (e) { $("profBNote").textContent = "scan failed: " + e.message; }
+  $("scanTime").disabled = false;
+};
+
+/* ---------- SQL console ---------- */
+function viewSql(name, urls) {
+  const st = chunkStrides();
+  const cols = S.dims.map((d, k) => `((i // ${st[k]}) % ${S.nch[k]})::INTEGER as "${d}_c"`).join(", ");
+  return `create or replace view ${name} as select i, ${cols}, path, "offset", size from (
+  select file_row_number + regexp_extract(filename, 'refs[.]([0-9]+)[.]parq', 1)::BIGINT * ${S.record} as i, path, "offset", size
+  from read_parquet([${urls.map(sq).join(", ")}], file_row_number=true, filename=true))`;
+}
+async function ensureViews() {
+  const total = S.nch.reduce((a, b) => a * b, 1), nf = Math.ceil(total / S.record);
+  const sl = S.slice || await loadSliceRefs();
+  const here = []; for (let k = sl.k0; k <= sl.k1; k++) here.push(refsUrl(k));
+  await q(viewSql("refs_here", here));
+  await q(viewSql("refs", Array.from({ length: nf }, (_, k) => refsUrl(k))));
+}
+function buildPresets() {
+  const box = $("presets"); box.innerHTML = "";
+  const { lo, hi } = sliceRange();
+  const nd = S.dims.length, d0 = S.dims[0];
+  const P = [
+    ["slice on screen", `select * from refs_here\nwhere i between ${lo} and ${hi}\norder by size desc;`],
+    ["source files", `select path, count(*) chunks, sum(size) bytes,\n  min("offset") first_byte, max("offset" + size) last_byte\nfrom refs_here group by path order by path;`],
+    ["size histogram", `select (size // 10000) * 10 as kB_bin, count(*) n\nfrom refs_here group by 1 order by 1;`],
+    ["whole store by file", `-- reads every refs file for this variable\nselect regexp_extract(path, '[^/]+$') file, count(*) chunks,\n  round(sum(size) / 1e6, 1) MB\nfrom refs group by 1 order by 1;`],
+  ];
+  if (nd >= 4) P.splice(3, 0, [`bytes by ${S.dims[nd - 3]}`, `select "${S.dims[nd - 3]}_c", sum(size) bytes, count(*) chunks\nfrom refs_here\nwhere "${d0}_c" = ${Math.floor(S.idx[0] / S.chunks[0])}\ngroup by 1 order by 1;`]);
+  for (const [lab, sql] of P) {
+    const b = document.createElement("button"); b.textContent = lab; b.onclick = () => { $("sql").value = sql; }; box.append(b);
+  }
+  $("sql").value = P[0][1];
+}
+$("runSql").onclick = async () => {
+  const out = $("sqlout"); out.innerHTML = "";
+  try {
+    if (!conn) { $("sqlNote").textContent = "loading DuckDB-Wasm (one-off, tens of MB)..."; await initDuck(); }
+    $("sqlNote").textContent = "running...";
+    await ensureViews();
+    const res = await q($("sql").value);
+    const show = res.rows.slice(0, 500);
+    let h = "<table><tr>" + res.cols.map((c) => `<th>${esc(c)}</th>`).join("") + "</tr>";
+    for (const r of show) h += "<tr>" + res.cols.map((c) => { const v = r[c]; const n = typeof v === "number" || typeof v === "bigint"; return `<td class="${n ? "num" : ""}">${esc(v instanceof Uint8Array ? "<" + v.length + " bytes>" : v)}</td>`; }).join("") + "</tr>";
+    out.innerHTML = h + "</table>";
+    $("sqlNote").textContent = `${res.rows.length} rows in ${res.ms.toFixed(0)} ms` + (res.rows.length > 500 ? " (first 500 shown)" : "");
+  } catch (e) { $("sqlNote").textContent = "error: " + e.message; }
+};
+
+/* ---------- metadata ---------- */
+function renderMeta() {
+  const za = S.za, a = S.attrs, total = S.nch.reduce((x, y) => x * y, 1);
+  const codecs = [...(za.filters || []).map((f) => f.id + (f.elementsize ? "(" + f.elementsize + ")" : f.level != null ? "(" + f.level + ")" : "")), za.compressor ? za.compressor.id + "(" + (za.compressor.level ?? "") + ")" : null].filter(Boolean).join(" -> ");
+  const rows = [
+    ["store", S.store + ` <span class="pill">${STORES.find((s) => s[0] === S.store)?.[1] || ""}</span>`],
+    ["array", S.v], ["dimensions", S.dims.join(", ")], ["shape", S.shape.join(" x ")], ["chunks", S.chunks.join(" x ")],
+    ["chunk grid", S.nch.join(" x ") + " = " + total.toLocaleString("en") + " chunks"],
+    ["refs files", Math.ceil(total / S.record) + " x refs.N.parq, record_size " + S.record],
+    ["dtype", esc(za.dtype)], ["codecs (encode order)", esc(codecs || "none")], ["fill_value", esc(String(za.fill_value))],
+  ];
+  for (const [k, v] of Object.entries(a)) if (k !== "_ARRAY_DIMENSIONS") rows.push([k, esc(JSON.stringify(v))]);
+  let h = '<table class="kv">' + rows.map(([x, y]) => `<tr><td>${x}</td><td class="mono">${y}</td></tr>`).join("") + "</table>";
+  h += `<div class="note">raw .zmetadata: <a href="${BASE}${S.store}/.zmetadata">${S.store}/.zmetadata</a></div>`;
+  $("meta").innerHTML = h;
+  // compare scale/offset with the sibling store for the same variable, if it is listed
+  const twin = siblingStore(S.store);
+  if (twin) compareTwin(twin);
+}
+function siblingStore(store) {
+  const m = /^(remote|zarr)\/(.+?)(?:_2023)?\.(?:parq|zarr)$/.exec(store); if (!m) return null;
+  const cand = m[1] === "remote" ? `zarr/${m[2]}.zarr` : `remote/${m[2]}_2023.parq`;
+  return STORES.some((s) => s[0] === cand) ? cand : null;
+}
+async function compareTwin(twin) {
+  try {
+    const txt = (await getText(BASE + twin + "/.zmetadata")).replace(/\bNaN\b/g, "null").replace(/-?\bInfinity\b/g, "null");
+    const m = JSON.parse(txt).metadata, za = m[S.v + "/.zarray"], at = m[S.v + "/.zattrs"];
+    if (!za) return;
+    const keys = ["shape", "chunks", "dtype", "fill_value"].map((k) => [k, S.za[k], za[k]]);
+    for (const k of ["scale_factor", "add_offset", "_FillValue", "missing_value", "units"]) keys.push([k, S.attrs[k], at && at[k]]);
+    const rows = keys.map(([k, a, b]) => { const same = JSON.stringify(a) === JSON.stringify(b); return `<tr><td>${k}</td><td class="mono">${esc(JSON.stringify(a))}</td><td class="mono" style="color:${same ? "inherit" : "var(--warn)"}">${esc(JSON.stringify(b))}</td></tr>`; }).join("");
+    $("meta").insertAdjacentHTML("beforeend", `<div style="margin-top:12px"><b>this store vs ${esc(twin)}</b></div><table><tr><th></th><th>here</th><th>twin</th></tr>${rows}</table><div class="note">Differences are highlighted. They change decoded values even when the referenced bytes are identical.</div>`);
+  } catch (e) { /* twin optional */ }
+}
+
+/* ---------- tabs, hash, boot ---------- */
+function showTab(id) {
+  document.querySelectorAll(".tabs button").forEach((b) => b.classList.toggle("on", b.dataset.tab === id));
+  document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("show", t.id === id));
+}
+document.querySelectorAll(".tabs button").forEach((b) => b.onclick = () => showTab(b.dataset.tab));
+function parseHash() {
+  const h = {}; for (const kv of location.hash.slice(1).split("&")) { const [k, v] = kv.split("="); if (k) h[k] = decodeURIComponent(v || ""); }
+  if (h.idx) h.idx = h.idx.split(",").map(Number);
+  return h;
+}
+function writeHash() {
+  const h = `#store=${encodeURIComponent(S.store)}&var=${encodeURIComponent(S.v)}&idx=${S.idx.join(",")}&mode=${S.mode}`;
+  history.replaceState(null, "", h);
+}
+$("mBytes").onclick = () => { setMode("bytes"); writeHash(); };
+$("mVals").onclick = () => { setMode("values"); writeHash(); };
+$("store").onchange = async () => { const vars = await loadStore($("store").value); await loadVar(vars[0]); };
+$("var").onchange = () => loadVar($("var").value);
+
+(async function boot() {
+  for (const [s, maker] of STORES) { const o = document.createElement("option"); o.value = s; o.textContent = s + "  (" + maker + ")"; $("store").append(o); }
+  const h = parseHash();
+  if (h.mode === "values") { S.mode = "values"; $("mBytes").classList.remove("on"); $("mVals").classList.add("on"); }
+  try {
+    status("loading Parquet reader...");
+    await initParquet();
+    const store = STORES.some((s) => s[0] === h.store) ? h.store : STORES[0][0];
+    $("store").value = store;
+    const vars = await loadStore(store);
+    const v = vars.includes(h.var) ? h.var : vars[0];
+    $("var").value = v;
+    await loadVar(v);
+  } catch (e) { status("error: " + e.message); console.error(e); }
+})();
+</script>
+</body>
+</html>

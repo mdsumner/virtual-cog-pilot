@@ -88,6 +88,7 @@
     <button data-tab="tChunk" class="on">chunk</button>
     <button data-tab="tProfile">profiles</button>
     <button data-tab="tSql">SQL</button>
+    <button data-tab="tContract">contract</button>
     <button data-tab="tMeta">metadata</button>
     <button data-tab="tAbout">about</button>
   </div>
@@ -119,6 +120,7 @@
     <div id="sqlout"></div>
   </div>
 
+  <div id="tContract" class="tab"><div id="contract"></div></div>
   <div id="tMeta" class="tab"><div id="meta"></div></div>
 
   <div id="tAbout" class="tab">
@@ -284,9 +286,11 @@ async function loadStore(store) {
   S.store = store;
   status("reading " + store + "/.zmetadata");
   // kerchunk writes bare NaN / Infinity, which JSON.parse rejects
-  const txt = (await getText(BASE + store + "/.zmetadata")).replace(/\bNaN\b/g, "null").replace(/-?\bInfinity\b/g, "null");
-  const j = JSON.parse(txt);
-  S.meta = j.metadata; S.record = j.record_size || 100000;
+  const rawTxt = await getText(BASE + store + "/.zmetadata");
+  let j;
+  try { j = JSON.parse(rawTxt); S.jsonRepaired = false; }
+  catch (e) { j = JSON.parse(rawTxt.replace(/\bNaN\b/g, "null").replace(/-?\bInfinity\b/g, "null")); S.jsonRepaired = true; }
+  S.meta = j.metadata; S.recordExplicit = j.record_size != null; S.record = j.record_size || 100000;
   const vars = Object.keys(S.meta).filter((k) => k.endsWith("/.zarray")).map((k) => k.slice(0, -8));
   const dataVars = vars.filter((v) => S.meta[v + "/.zarray"].shape.length >= 2 && !/_bnds$|_bounds$/.test(v));
   dataVars.sort((a, b) => S.meta[b + "/.zarray"].shape.length - S.meta[a + "/.zarray"].shape.length);
@@ -341,15 +345,16 @@ function toTyped(b, dt) {
 /* ---------- coordinates ---------- */
 async function loadCoord(name) {
   const za = S.meta[name + "/.zarray"];
+  S.coordSrc[name] = "absent";
   if (!za || za.shape.length !== 1) return null;
   const nfile = Math.ceil(Math.ceil(za.shape[0] / za.chunks[0]) / S.record);
-  if (nfile !== 1) return null;
+  if (nfile !== 1) { S.coordSrc[name] = "multi-file"; return null; }
   const rows = await readRows(refsUrl(0, name), ["path", "offset", "size", "raw"], 0, Math.ceil(za.shape[0] / za.chunks[0]) - 1);
   const parts = [];
   for (const r of rows) {
     let buf;
-    if (r.raw && r.raw.length) buf = r.raw;
-    else if (r.path) buf = new Uint8Array(await rangeGet(r.path, r.offset, r.size));
+    if (r.raw && r.raw.length) { buf = r.raw; S.coordSrc[name] = "inline"; }
+    else if (r.path) { S.coordSrc[name] = "remote"; buf = new Uint8Array(await rangeGet(r.path, r.offset, r.size)); }
     else return null;
     parts.push(await decodeBytes(buf, za));
   }
@@ -374,15 +379,7 @@ function coordLabel(d, i) {
 /* ---------- grid arithmetic ---------- */
 /* ---------- display axes: any two dimensions, sliders for the rest ---------- */
 function defaultAxes() { const nd = S.dims.length; return [nd - 2, nd - 1]; }
-function axisRole(d) {
-  const name = S.dims[d], at = (S.meta && S.meta[name + "/.zattrs"]) || {};
-  const ca = String(at.cartesian_axis || at.axis || "").toUpperCase(), u = String(at.units || "").toLowerCase(), n = name.toLowerCase();
-  if (ca === "X" || /east/.test(u) || /^(lon|longitude|x[tu]_)/.test(n)) return "X";
-  if (ca === "Y" || /north/.test(u) || /^(lat|latitude|y[tu]_)/.test(n)) return "Y";
-  if (ca === "Z" || at.positive || /^(depth|lev|s[tw]_ocean|z$)/.test(n)) return "Z";
-  if (ca === "T" || /since/.test(u)) return "T";
-  return "";
-}
+function axisRole(d) { return axisRoleInfo(d).role; }
 function roleDim(role) { for (let d = 0; d < S.dims.length; d++) if (axisRole(d) === role) return d; return -1; }
 function isLonLat() { return axisRole(S.ax[0]) === "Y" && axisRole(S.ax[1]) === "X"; }
 function isDefaultAxes() { const a = defaultAxes(); return S.ax[0] === a[0] && S.ax[1] === a[1]; }
@@ -423,9 +420,9 @@ async function loadVar(v) {
   const h = parseHash();
   if (h.idx && h.store === S.store && h.var === v) h.idx.forEach((x, d) => { if (d < S.idx.length) S.idx[d] = Math.max(0, Math.min(S.shape[d] - 1, x)); });
   status("reading coordinates");
-  S.coords = {};
+  S.coords = {}; S.coordSrc = {}; S.twinDiff = null; S.lastFile = null;
   for (const d of S.dims) {
-    try { const c = await loadCoord(d); if (c) S.coords[d] = c; } catch (e) { /* labels fall back to indices */ }
+    try { const c = await loadCoord(d); if (c) S.coords[d] = c; } catch (e) { S.coordSrc[d] = (S.coordSrc[d] || "remote") + " (failed)"; }
     if (gen !== S.gen) return;
   }
   S.ax = defaultAxes();
@@ -437,7 +434,7 @@ async function loadVar(v) {
     if ([x, y, w].every(Number.isFinite)) S.view = clampView({ x, y, w, h: Number.isFinite(hh) ? hh : w * spatialGeom().H / spatialGeom().W });
   }
   if (S.coastOn) { try { if (!(await ensureCoast())) S.coastXY = null; } catch (e) { S.coastXY = null; } }
-  buildSliders(); renderMeta(); buildPresets(); $("chunkInfo").innerHTML = "";
+  buildSliders(); renderMeta(); buildPresets(); buildContract(); checkLastRefsFile(); $("chunkInfo").innerHTML = "";
   $("chartB").getContext("2d").clearRect(0, 0, 800, 140); $("profBNote").textContent = ""; $("scanNote").textContent = ""; estimateScan();
   await refresh();
 }
@@ -1227,6 +1224,92 @@ $("runSql").onclick = async () => {
 };
 
 /* ---------- metadata ---------- */
+/* ---------- contract: what the store states, and what this page had to infer ---------- */
+// status per item: explicit (stated by the store), convention (a format rule the store relies on
+// but does not state), inferred (a heuristic fired), missing, conflict
+function axisRoleInfo(d) {
+  const name = S.dims[d], at = (S.meta && S.meta[name + "/.zattrs"]) || {};
+  const ca = String(at.cartesian_axis || at.axis || "").toUpperCase(), u = String(at.units || "").toLowerCase(), n = name.toLowerCase();
+  if (["X", "Y", "Z", "T"].includes(ca)) return { role: ca, by: "attribute", detail: (at.axis ? "axis" : "cartesian_axis") + " = " + ca };
+  if (/east/.test(u)) return { role: "X", by: "units", detail: "units " + at.units };
+  if (/north/.test(u)) return { role: "Y", by: "units", detail: "units " + at.units };
+  if (at.positive) return { role: "Z", by: "attribute", detail: "positive = " + at.positive };
+  if (/since/.test(u)) return { role: "T", by: "units", detail: "units " + at.units };
+  if (/^(lon|longitude|x[tu]_)/.test(n)) return { role: "X", by: "name", detail: "name " + name };
+  if (/^(lat|latitude|y[tu]_)/.test(n)) return { role: "Y", by: "name", detail: "name " + name };
+  if (/^(depth|lev|s[tw]_ocean|z$)/.test(n)) return { role: "Z", by: "name", detail: "name " + name };
+  return { role: "", by: "none", detail: "no role found" };
+}
+function buildContract() {
+  if (!S.za) return;
+  const C = [], add = (area, item, st, detail) => C.push({ area, item, status: st, detail });
+  const za = S.za, a = S.attrs;
+  // store level
+  add("store", "metadata is strict JSON", S.jsonRepaired ? "inferred" : "explicit", S.jsonRepaired ? "bare NaN/Infinity tokens replaced with null before parsing" : "parsed as-is");
+  add("store", "record_size", S.recordExplicit ? "explicit" : "inferred", S.recordExplicit ? String(S.record) : "absent; assumed 100000");
+  add("store", "chunk id to refs file and row", "convention", `C-order flat chunk index i; file floor(i / ${S.record}), row i mod ${S.record} (kerchunk Parquet rule, not stated in the store)`);
+  if (S.lastFile) add("store", "refs file count", S.lastFile.ok ? "explicit" : "conflict", S.lastFile.detail);
+  // array level
+  add("array", "_ARRAY_DIMENSIONS", a._ARRAY_DIMENSIONS ? "explicit" : "missing", a._ARRAY_DIMENSIONS ? a._ARRAY_DIMENSIONS.join(", ") : "dimension names invented");
+  const codecs = [...(za.filters || []), ...(za.compressor ? [za.compressor] : [])].map((c) => c.id);
+  const unknown = codecs.filter((c) => !["zlib", "gzip", "shuffle"].includes(c));
+  add("array", "codecs", unknown.length ? "missing" : "explicit", (codecs.join(" -> ") || "none") + (unknown.length ? "; not decodable here: " + unknown.join(", ") : ""));
+  const fills = [["fill_value (.zarray)", za.fill_value], ["_FillValue", a._FillValue], ["missing_value", a.missing_value]].filter(([, v]) => v !== null && v !== undefined);
+  const distinct = [...new Set(fills.map(([, v]) => String(v)))];
+  add("array", "fill / missing", fills.length === 0 ? "missing" : distinct.length > 1 ? "conflict" : "explicit",
+    fills.length ? fills.map(([k, v]) => k + " " + v).join("; ") + (distinct.length > 1 ? "; this page masks all of them" : "") : "none stated");
+  const packed = a.scale_factor != null || a.add_offset != null;
+  add("array", "packing (scale_factor, add_offset)", "explicit", packed ? `scale ${a.scale_factor ?? 1}, offset ${a.add_offset ?? 0}` : "unpacked");
+  if (S.twinDiff) add("array", "agreement with twin store", S.twinDiff.keys.length ? "conflict" : "explicit", S.twinDiff.keys.length ? `${S.twinDiff.twin} differs in ${S.twinDiff.keys.join(", ")}` : `matches ${S.twinDiff.twin}`);
+  const edge = S.shape.map((n, d) => n % S.chunks[d]).some((r) => r);
+  add("array", "chunk grid", "explicit", `${S.nch.join(" x ")}${edge ? ", with partial edge chunks" : ", no partial edge chunks"}`);
+  // dimensions
+  S.dims.forEach((name, d) => {
+    const r = axisRoleInfo(d);
+    add("dim " + name, "axis role", r.by === "attribute" ? "explicit" : r.by === "none" ? "missing" : "inferred", (r.role || "-") + " from " + r.detail);
+    const src = S.coordSrc[name] || "absent";
+    add("dim " + name, "coordinate values", src === "inline" ? "explicit" : src.startsWith("remote") ? (src.includes("failed") ? "missing" : "inferred") : "missing",
+      src === "inline" ? "inline in the refs (no fetch needed)" : src.startsWith("remote") ? "referenced bytes on the data server" + (src.includes("failed") ? ", not reachable from the browser" : "") : src === "multi-file" ? "spans several refs files; not read" : "no coordinate array; index labels used");
+    const at = S.meta[name + "/.zattrs"] || {};
+    if (r.role === "T") add("dim " + name, "time encoding", /since/.test(at.units || "") ? (at.calendar ? "explicit" : "inferred") : "missing", (at.units || "no units") + (at.calendar ? ", calendar " + at.calendar : ", calendar not stated; Gregorian assumed"));
+    if (r.role === "Y" && S.coords[name]) { const c = S.coords[name]; add("dim " + name, "orientation", "inferred", c[0] < c[c.length - 1] ? "ascending, so flipped for north-up display" : "descending, drawn as stored"); }
+    if (r.role === "X" && S.coords[name]) { const c = S.coords[name], lo = Math.min(c[0], c[c.length - 1]), hi = Math.max(c[0], c[c.length - 1]); add("dim " + name, "longitude convention", "inferred", `${lo.toFixed(2)} to ${hi.toFixed(2)}` + (hi > 180 ? " (0-360)" : " (-180-180)")); }
+    if (r.role === "Z") add("dim " + name, "vertical direction", at.positive ? "explicit" : "inferred", at.positive ? "positive " + at.positive : "not stated; depth assumed positive down");
+  });
+  S.contract = C;
+  renderContract();
+}
+function renderContract() {
+  const C = S.contract || [], cnt = {};
+  for (const c of C) cnt[c.status] = (cnt[c.status] || 0) + 1;
+  const col = { explicit: "#5ec4b6", convention: "#8fa1ad", inferred: "#e8a65a", missing: "#e46b6b", conflict: "#e46b6b" };
+  const pill = (st) => `<span class="pill" style="color:${col[st]};border-color:${col[st]}">${st}</span>`;
+  let h = `<div class="row" style="margin-bottom:8px">${["explicit", "convention", "inferred", "missing", "conflict"].filter((k) => cnt[k]).map((k) => pill(k) + " " + cnt[k]).join(" &nbsp; ")}</div>`;
+  h += `<div class="note">What <b>${esc(S.store)}</b> / <b>${esc(S.v)}</b> states about itself, and what this page had to infer to read it. A store that is clear about its structure shows no inferred, missing or conflict rows.</div>`;
+  h += "<table><tr><th>where</th><th>item</th><th></th><th>detail</th></tr>" + C.map((c) => `<tr><td>${esc(c.area)}</td><td>${esc(c.item)}</td><td>${pill(c.status)}</td><td class="mono">${esc(c.detail)}</td></tr>`).join("") + "</table>";
+  h += `<div class="row" style="margin-top:8px"><button id="cpContract">copy as JSON</button></div>`;
+  $("contract").innerHTML = h;
+  $("cpContract").onclick = async () => {
+    const b = $("cpContract");
+    const doc = { store: BASE + S.store, variable: S.v, checked: new Date().toISOString(), items: S.contract };
+    try { await navigator.clipboard.writeText(JSON.stringify(doc, null, 2)); b.textContent = "copied"; } catch (e) { b.textContent = "copy failed"; }
+  };
+}
+async function checkLastRefsFile() {
+  // the refs file count implied by the chunk grid should exist, and nothing beyond it
+  const total = S.nch.reduce((x, y) => x * y, 1), nf = Math.ceil(total / S.record), gen = S.gen;
+  try {
+    const { metadata } = await pqFile(refsUrl(nf - 1));
+    const rows = Number(metadata.num_rows), need = total - (nf - 1) * S.record;
+    if (gen !== S.gen) return;
+    S.lastFile = { ok: rows >= need, detail: `${nf} files implied by the grid; refs.${nf - 1}.parq has ${rows} rows (${need} needed${rows > need ? ", padded" : ""})` };
+  } catch (e) {
+    if (gen !== S.gen) return;
+    S.lastFile = { ok: false, detail: `${nf} files implied by the grid, but refs.${nf - 1}.parq could not be read` };
+  }
+  buildContract();
+}
+
 function renderMeta() {
   const za = S.za, a = S.attrs, total = S.nch.reduce((x, y) => x * y, 1);
   const codecs = [...(za.filters || []).map((f) => f.id + (f.elementsize ? "(" + f.elementsize + ")" : f.level != null ? "(" + f.level + ")" : "")), za.compressor ? za.compressor.id + "(" + (za.compressor.level ?? "") + ")" : null].filter(Boolean).join(" -> ");
@@ -1257,6 +1340,8 @@ async function compareTwin(twin) {
     if (!za) return;
     const keys = ["shape", "chunks", "dtype", "fill_value"].map((k) => [k, S.za[k], za[k]]);
     for (const k of ["scale_factor", "add_offset", "_FillValue", "missing_value", "units"]) keys.push([k, S.attrs[k], at && at[k]]);
+    S.twinDiff = { twin, keys: keys.filter(([, a, b]) => JSON.stringify(a) !== JSON.stringify(b)).map(([k]) => k) };
+    buildContract();
     const rows = keys.map(([k, a, b]) => { const same = JSON.stringify(a) === JSON.stringify(b); return `<tr><td>${k}</td><td class="mono">${esc(JSON.stringify(a))}</td><td class="mono" style="color:${same ? "inherit" : "var(--warn)"}">${esc(JSON.stringify(b))}</td></tr>`; }).join("");
     $("meta").insertAdjacentHTML("beforeend", `<div style="margin-top:12px"><b>this store vs ${esc(twin)}</b></div><table><tr><th></th><th>here</th><th>twin</th></tr>${rows}</table><div class="note">Differences are highlighted. They change decoded values even when the referenced bytes are identical.</div>`);
   } catch (e) { /* twin optional */ }

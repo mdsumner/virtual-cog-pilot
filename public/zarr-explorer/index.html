@@ -30,7 +30,10 @@
     background: #3a2b18; color: #f3d2a6; border: 1px solid #6a4c25; font-size: 13px; }
   main { padding: 8px 12px 40px; }
   #stage { position: relative; width: 100%; background: #0a0d10; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; touch-action: manipulation; }
-  #cv { width: 100%; display: block; image-rendering: pixelated; }
+  #cv { width: 100%; display: block; touch-action: none; cursor: crosshair; }
+  #tools { display: flex; gap: 4px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
+  #tools button { padding: 4px 10px; font-size: 13px; min-width: 34px; }
+  #zoomLab { font: 11px ui-monospace, monospace; color: var(--dim); background: rgba(15,20,24,.82); padding: 3px 5px; border-radius: 4px; }
   #legend { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--dim); margin: 6px 0; flex-wrap: wrap; }
   #legend canvas { width: 160px; height: 10px; border-radius: 2px; }
   .slider { display: grid; grid-template-columns: 90px 1fr 150px; gap: 8px; align-items: center; margin: 6px 0; }
@@ -70,6 +73,12 @@
 <div id="banner"></div>
 <main>
   <div id="stage"><canvas id="cv" width="12" height="5"></canvas></div>
+    <div id="tools">
+      <button id="bIn" title="zoom in">+</button><button id="bOut" title="zoom out">&minus;</button>
+      <button id="bHome" title="whole grid">all</button><button id="bChunk" title="zoom to the selected chunk">chunk</button>
+      <button id="bCoast" title="coastline overlay">coast</button><span id="zoomLab">1x</span>
+    </div>
+  <div class="note" style="margin:4px 0 0">Drag to pan, pinch or scroll to zoom, tap a chunk to inspect it, double-tap to zoom to it.</div>
   <div id="legend"></div>
   <div id="sliders"></div>
 
@@ -384,6 +393,13 @@ async function loadVar(v) {
     try { const c = await loadCoord(d); if (c) S.coords[d] = c; } catch (e) { /* labels fall back to indices */ }
     if (gen !== S.gen) return;
   }
+  S.pick = null; resetView();
+  if (h.view && h.store === S.store && h.var === v) {
+    const [x, y, w] = h.view.split(",").map(Number);
+    const hh = h.view.split(",").map(Number)[3];
+    if ([x, y, w].every(Number.isFinite)) S.view = clampView({ x, y, w, h: Number.isFinite(hh) ? hh : w * spatialGeom().H / spatialGeom().W });
+  }
+  if (S.coastOn) { try { if (!(await ensureCoast())) S.coastXY = null; } catch (e) { S.coastXY = null; } }
   buildSliders(); renderMeta(); buildPresets(); $("chunkInfo").innerHTML = "";
   $("chartB").getContext("2d").clearRect(0, 0, 800, 140); $("profBNote").textContent = ""; $("scanNote").textContent = ""; estimateScan();
   await refresh();
@@ -449,47 +465,157 @@ function spatialGeom() {
   const flip = yc ? yc[0] < yc[yc.length - 1] : false; // north up
   return { H, W, flip, cy: S.chunks[nd - 2], cx: S.chunks[nd - 1] };
 }
-function sizeCanvas(W, H) {
-  const cv = $("cv");
-  // keep values at full resolution; cap really large grids
-  const sc = Math.min(1, 4096 / Math.max(W, H));
-  cv.width = Math.max(1, Math.round(W * sc)); cv.height = Math.max(1, Math.round(H * sc));
-  return sc;
+
+/* ---------- view: a window onto the base image, in display pixels (north up) ---------- */
+function resetView() { const g = spatialGeom(); S.view = { x: 0, y: 0, w: g.W, h: g.H }; }
+function maxRatio() {
+  // tallest frame allowed (height / width), so a zoomed chunk can fill a phone screen
+  const w = $("stage").clientWidth || 360;
+  return Math.max(0.2, (window.innerHeight * 0.62) / w);
+}
+function clampView(v) {
+  const g = spatialGeom(), mn = Math.min(g.W, g.H, 12);
+  if (v.w < mn) { v.h *= mn / v.w; v.w = mn; }
+  if (v.h < mn) { v.w *= mn / v.h; v.h = mn; }
+  v.w = Math.min(v.w, g.W); v.h = Math.min(v.h, g.H);
+  if (v.h / v.w > maxRatio()) v.h = v.w * maxRatio();
+  v.x = Math.max(0, Math.min(g.W - v.w, v.x)); v.y = Math.max(0, Math.min(g.H - v.h, v.y));
+  return v;
+}
+function zoomAt(f, sx, sy) {
+  // f > 1 zooms in, about screen fraction (sx, sy)
+  const v = S.view, nw = v.w / f, nh = v.h / f;
+  S.view = clampView({ x: v.x + (v.w - nw) * sx, y: v.y + (v.h - nh) * sy, w: nw, h: nh });
+  render(); writeHashSoon();
+}
+function chunkRectDisplay(cyI, cxI) {
+  const g = spatialGeom();
+  const y0 = cyI * g.cy, y1 = Math.min(g.H, y0 + g.cy), x0 = cxI * g.cx, x1 = Math.min(g.W, x0 + g.cx);
+  return { x: x0, y: g.flip ? g.H - y1 : y0, w: x1 - x0, h: y1 - y0 };
+}
+function zoomToChunk(cyI, cxI) {
+  const r = chunkRectDisplay(cyI, cxI), pad = 1.15, ratio = Math.min(r.h / r.w, maxRatio());
+  const w = Math.max(r.w * pad, (r.h * pad) / ratio), h = w * ratio;
+  S.view = clampView({ x: r.x + r.w / 2 - w / 2, y: r.y + r.h / 2 - h / 2, w, h });
+  render(); writeHashSoon();
+}
+
+function render() {
+  const cv = $("cv"); if (!S.base || !S.view) return;
+  const g = spatialGeom(), v = S.view, dpr = window.devicePixelRatio || 1;
+  const cssW = $("stage").clientWidth || 360;
+  cv.width = Math.round(cssW * dpr); cv.height = Math.round(cssW * dpr * v.h / v.w);
+  const ctx = cv.getContext("2d"), cw = cv.width, ch = cv.height;
+  ctx.imageSmoothingEnabled = false;
+  ctx.fillStyle = "#0a0d10"; ctx.fillRect(0, 0, cw, ch);
+  ctx.drawImage(S.base, v.x, v.y, v.w, v.h, 0, 0, cw, ch);
+  const kx = cw / v.w, ky = ch / v.h;
+  const sxOf = (x) => (x - v.x) * kx, syOf = (y) => (y - v.y) * ky;
+  // chunk grid
+  const sl = S.slice;
+  if (sl) {
+    ctx.strokeStyle = S.mode === "bytes" ? "rgba(255,255,255,.18)" : "rgba(255,255,255,.10)"; ctx.lineWidth = 1;
+    for (let i = 0; i <= sl.nx; i++) { const x = Math.round(sxOf(Math.min(g.W, i * g.cx))) + .5; if (x < -1 || x > cw + 1) continue; ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, ch); ctx.stroke(); }
+    for (let j = 0; j <= sl.ny; j++) { const yy = Math.min(g.H, j * g.cy), y = Math.round(syOf(g.flip ? g.H - yy : yy)) + .5; if (y < -1 || y > ch + 1) continue; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(cw, y); ctx.stroke(); }
+  }
+  // coastline
+  if (S.coastOn && S.coastXY) {
+    ctx.strokeStyle = "rgba(255,255,255,.85)"; ctx.lineWidth = Math.max(1, dpr * 0.9); ctx.lineJoin = "round";
+    ctx.beginPath();
+    for (const ln of S.coastXY) {
+      let pen = false, px = 0;
+      for (let i = 0; i < ln.length; i += 2) {
+        const x = ln[i], y = ln[i + 1];
+        if (!Number.isFinite(x) || (pen && Math.abs(x - px) > g.W / 2)) { pen = false; if (!Number.isFinite(x)) continue; }
+        const X = sxOf(x), Y = syOf(y);
+        if (pen) ctx.lineTo(X, Y); else ctx.moveTo(X, Y);
+        pen = true; px = x;
+      }
+    }
+    ctx.stroke();
+  }
+  // selection
+  if (S.sel) {
+    const r = chunkRectDisplay(S.sel[0], S.sel[1]);
+    ctx.strokeStyle = "#5ec4b6"; ctx.lineWidth = 2.5 * dpr;
+    ctx.strokeRect(sxOf(r.x), syOf(r.y), r.w * kx, r.h * ky);
+  }
+  if (S.pick) {
+    const px = sxOf(S.pick[1] + 0.5), py = syOf((g.flip ? g.H - 1 - S.pick[0] : S.pick[0]) + 0.5);
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5 * dpr;
+    ctx.beginPath(); ctx.arc(px, py, 5 * dpr, 0, Math.PI * 2); ctx.stroke();
+  }
+  const z = g.W / v.w;
+  $("zoomLab").textContent = z < 1.05 ? "1x" : (z < 10 ? z.toFixed(1) : z.toFixed(0)) + "x";
+}
+
+function newBase() {
+  const g = spatialGeom();
+  if (!S.base || S.base.width !== g.W || S.base.height !== g.H) { S.base = document.createElement("canvas"); S.base.width = g.W; S.base.height = g.H; }
+  return S.base;
 }
 
 function drawBytes() {
-  const sl = S.slice, g = spatialGeom(), cv = $("cv"), ctx = cv.getContext("2d");
-  const sc = sizeCanvas(g.W, g.H);
+  const sl = S.slice, g = spatialGeom(), base = newBase(), ctx = base.getContext("2d");
   const sizes = sl.refs.filter((r) => r && r.path).map((r) => r.s);
   const lo = Math.log(Math.max(1, Math.min(...sizes))), hi = Math.log(Math.max(...sizes));
-  ctx.fillStyle = "#0a0d10"; ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.fillStyle = "#0a0d10"; ctx.fillRect(0, 0, g.W, g.H);
   const T = LUT.magma;
   for (let cyI = 0; cyI < sl.ny; cyI++) for (let cxI = 0; cxI < sl.nx; cxI++) {
-    const r = sl.refs[cyI * sl.nx + cxI];
-    const y0 = cyI * g.cy, y1 = Math.min(g.H, y0 + g.cy), x0 = cxI * g.cx, x1 = Math.min(g.W, x0 + g.cx);
-    const py0 = g.flip ? g.H - y1 : y0;
+    const r = sl.refs[cyI * sl.nx + cxI], rc = chunkRectDisplay(cyI, cxI);
     if (!r || !r.path) { ctx.fillStyle = r && r.raw ? "#335" : "#222"; }
     else {
       const t = hi > lo ? (Math.log(r.s) - lo) / (hi - lo) : 0.5, k = Math.round(t * 255) * 3;
       ctx.fillStyle = `rgb(${T[k]},${T[k + 1]},${T[k + 2]})`;
     }
-    ctx.fillRect(x0 * sc, py0 * sc, (x1 - x0) * sc, (y1 - y0) * sc);
+    ctx.fillRect(rc.x, rc.y, rc.w, rc.h);
   }
-  ctx.strokeStyle = "rgba(255,255,255,.18)"; ctx.lineWidth = 1;
-  for (let i = 0; i <= sl.nx; i++) { const x = Math.min(g.W, i * g.cx) * sc; ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, cv.height); ctx.stroke(); }
-  for (let j = 0; j <= sl.ny; j++) { const y = Math.min(g.H, j * g.cy) * sc; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(cv.width, y); ctx.stroke(); }
-  drawSel();
+  render();
   legend("magma", fmtB(Math.round(Math.exp(lo))), fmtB(Math.round(Math.exp(hi))), "compressed bytes per chunk (log)");
 }
 
-function drawSel() {
-  if (!S.sel) return;
-  const g = spatialGeom(), cv = $("cv"), ctx = cv.getContext("2d"), sc = cv.width / g.W;
-  const [cyI, cxI] = S.sel;
-  const y0 = cyI * g.cy, y1 = Math.min(g.H, y0 + g.cy), x0 = cxI * g.cx, x1 = Math.min(g.W, x0 + g.cx);
-  const py0 = g.flip ? g.H - y1 : y0;
-  ctx.strokeStyle = "#5ec4b6"; ctx.lineWidth = Math.max(2, 3 * sc);
-  ctx.strokeRect(x0 * sc, py0 * sc, (x1 - x0) * sc, (y1 - y0) * sc);
+/* ---------- coastline (Natural Earth 1:50m, vendored next to this page) ---------- */
+function frac(c, v) {
+  // fractional index of v in a monotonic coordinate array
+  const n = c.length, asc = c[n - 1] > c[0];
+  let lo = 0, hi = n - 1;
+  if (asc ? v <= c[0] : v >= c[0]) return (v - c[0]) / (c[1] - c[0]);
+  if (asc ? v >= c[n - 1] : v <= c[n - 1]) return n - 1 + (v - c[n - 1]) / (c[n - 1] - c[n - 2]);
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (asc ? c[m] <= v : c[m] >= v) lo = m; else hi = m; }
+  return lo + (v - c[lo]) / (c[hi] - c[lo]);
+}
+async function ensureCoast() {
+  if (!S.coastLL) {
+    status("loading coastline...");
+    const j = JSON.parse(await getText("coast50.json"));
+    S.coastLL = j.lines.map((d) => {
+      const out = new Float64Array(d.length); let x = 0, y = 0;
+      for (let i = 0; i < d.length; i += 2) { x += d[i]; y += d[i + 1]; out[i] = x / 100; out[i + 1] = y / 100; }
+      return out;
+    });
+  }
+  const nd = S.dims.length, xc = S.coords[S.dims[nd - 1]], yc = S.coords[S.dims[nd - 2]];
+  if (!xc || !yc) { S.coastXY = null; return false; }
+  const g = spatialGeom(), dx = (xc[xc.length - 1] - xc[0]) / (xc.length - 1), west = xc[0] - dx / 2;
+  const global = Math.abs(dx * xc.length - 360) < 2 * Math.abs(dx);
+  S.coastXY = S.coastLL.map((ln) => {
+    const out = new Float32Array(ln.length);
+    for (let i = 0; i < ln.length; i += 2) {
+      let lon = ln[i]; if (global) lon = west + ((((lon - west) % 360) + 360) % 360);
+      const fx = frac(xc, lon), fy = frac(yc, ln[i + 1]);
+      out[i] = fx + 0.5; out[i + 1] = g.flip ? g.H - (fy + 0.5) : fy + 0.5;
+    }
+    return out;
+  });
+  return true;
+}
+async function toggleCoast(on) {
+  S.coastOn = on; $("bCoast").classList.toggle("on", on);
+  if (on) {
+    try { if (!(await ensureCoast())) { status("no lon/lat coordinates for this variable, so no coastline"); S.coastOn = false; $("bCoast").classList.remove("on"); } }
+    catch (e) { status("coastline failed: " + e.message); S.coastOn = false; $("bCoast").classList.remove("on"); }
+  }
+  render(); writeHashSoon();
 }
 
 /* ---------- values ---------- */
@@ -520,6 +646,12 @@ async function loadValues() {
   S.vals = vals;
   const U = unpackInfo(), inner = innerOffset();
   const todo = sl.refs.map((r, k) => [r, k]).filter(([r]) => r && (r.path || r.raw));
+  // fetch what is on screen first
+  if (S.view) {
+    const v = S.view, cx = v.x + v.w / 2, cy = v.y + v.h / 2;
+    const d2 = (k) => { const r = chunkRectDisplay(Math.floor(k / sl.nx), k % sl.nx); return (r.x + r.w / 2 - cx) ** 2 + (r.y + r.h / 2 - cy) ** 2; };
+    todo.sort((a, b) => d2(a[1]) - d2(b[1]));
+  }
   let done = 0, failed = 0, bytes = 0, firstErr = null;
   const t0 = performance.now();
   const work = async () => {
@@ -558,13 +690,13 @@ async function loadValues() {
   }
   banner(null);
   drawValues(true);
+  if (S.sel) showChunk(S.sel[0], S.sel[1]);
   status(`values: ${done - failed}/${sl.refs.length} chunks decoded, ${fmtB(bytes)} fetched in ${((performance.now() - t0) / 1000).toFixed(1)} s` + (failed ? `, ${failed} failed` : ""));
 }
 
 function drawValues(final) {
   const vals = S.vals; if (!vals) return;
-  const g = spatialGeom(), cv = $("cv");
-  sizeCanvas(g.W, g.H);
+  const g = spatialGeom();
   if (final || !S.range) {
     const smp = [];
     const step = Math.max(1, Math.floor(vals.length / 200000));
@@ -572,9 +704,8 @@ function drawValues(final) {
     if (smp.length) { smp.sort((a, b) => a - b); S.range = [smp[Math.floor(smp.length * 0.01)], smp[Math.floor(smp.length * 0.99)]]; }
   }
   const [lo, hi] = S.range || [0, 1];
-  const W = g.W, H = g.H;
-  const full = document.createElement("canvas"); full.width = W; full.height = H;
-  const fctx = full.getContext("2d"), im = fctx.createImageData(W, H), T = LUT.viridis, d = im.data;
+  const W = g.W, H = g.H, base = newBase();
+  const fctx = base.getContext("2d"), im = fctx.createImageData(W, H), T = LUT.viridis, d = im.data;
   for (let y = 0; y < H; y++) {
     const yy = g.flip ? H - 1 - y : y;
     for (let x = 0; x < W; x++) {
@@ -585,9 +716,7 @@ function drawValues(final) {
     }
   }
   fctx.putImageData(im, 0, 0);
-  const ctx = cv.getContext("2d"); ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(full, 0, 0, cv.width, cv.height);
-  drawSel();
+  render();
   const u = S.attrs.units || "";
   legend("viridis", lo.toPrecision(4), hi.toPrecision(4), (S.attrs.long_name || S.v) + (u ? " (" + u + ")" : "") + ", 1-99%");
 }
@@ -599,19 +728,84 @@ function setMode(m) {
   if (m === "values") { S.range = null; loadValues(); } else drawBytes();
 }
 
-/* ---------- tap a chunk ---------- */
-$("cv").addEventListener("click", (ev) => {
-  if (!S.slice) return;
-  const g = spatialGeom(), r = ev.target.getBoundingClientRect();
-  const fx = (ev.clientX - r.left) / r.width, fy = (ev.clientY - r.top) / r.height;
-  const col = Math.min(g.W - 1, Math.floor(fx * g.W));
-  let row = Math.min(g.H - 1, Math.floor(fy * g.H)); if (g.flip) row = g.H - 1 - row;
+/* ---------- pointer: tap selects, double-tap zooms to chunk, drag pans, pinch/wheel zoom ---------- */
+function screenToArray(clientX, clientY) {
+  const g = spatialGeom(), r = $("cv").getBoundingClientRect(), v = S.view;
+  const ax = v.x + ((clientX - r.left) / r.width) * v.w, ay = v.y + ((clientY - r.top) / r.height) * v.h;
+  const col = Math.max(0, Math.min(g.W - 1, Math.floor(ax)));
+  let row = Math.max(0, Math.min(g.H - 1, Math.floor(ay))); if (g.flip) row = g.H - 1 - row;
+  return { row, col };
+}
+function selectAt(clientX, clientY) {
+  if (!S.slice) return null;
+  const g = spatialGeom(), { row, col } = screenToArray(clientX, clientY);
   S.sel = [Math.floor(row / g.cy), Math.floor(col / g.cx)];
   S.pick = [row, col];
-  if (S.mode === "values" && S.vals) drawValues(false); else drawBytes();
-  showChunk(S.sel[0], S.sel[1]);
-  showTab("tChunk");
-});
+  render(); showChunk(S.sel[0], S.sel[1]); showTab("tChunk");
+  return S.sel;
+}
+(function pointerSetup() {
+  const cv = $("cv"), ptr = new Map();
+  let moved = false, start = null, pinch = null, lastTap = { t: 0, x: 0, y: 0 };
+  cv.addEventListener("pointerdown", (e) => {
+    cv.setPointerCapture(e.pointerId); ptr.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (ptr.size === 1) { moved = false; start = { x: e.clientX, y: e.clientY, view: { ...S.view } }; }
+    if (ptr.size === 2) {
+      const [a, b] = [...ptr.values()];
+      pinch = { d: Math.hypot(a.x - b.x, a.y - b.y), view: { ...S.view }, mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 };
+      moved = true;
+    }
+  });
+  cv.addEventListener("pointermove", (e) => {
+    if (!ptr.has(e.pointerId) || !S.view) return;
+    ptr.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const r = cv.getBoundingClientRect();
+    if (ptr.size === 2 && pinch) {
+      const [a, b] = [...ptr.values()], d = Math.hypot(a.x - b.x, a.y - b.y);
+      const f = d / pinch.d, v0 = pinch.view, sx = (pinch.mx - r.left) / r.width, sy = (pinch.my - r.top) / r.height;
+      const nw = v0.w / f, nh = v0.h / f;
+      const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+      S.view = clampView({ x: v0.x + (v0.w - nw) * sx - ((mx - pinch.mx) / r.width) * nw, y: v0.y + (v0.h - nh) * sy - ((my - pinch.my) / r.height) * nh, w: nw, h: nh });
+      render(); return;
+    }
+    if (ptr.size === 1 && start) {
+      const dx = e.clientX - start.x, dy = e.clientY - start.y;
+      if (!moved && Math.hypot(dx, dy) < 6) return;
+      moved = true;
+      const v0 = start.view;
+      S.view = clampView({ x: v0.x - (dx / r.width) * v0.w, y: v0.y - (dy / r.height) * v0.h, w: v0.w, h: v0.h });
+      render();
+    }
+  });
+  const end = (e) => {
+    if (!ptr.has(e.pointerId)) return;
+    ptr.delete(e.pointerId);
+    if (ptr.size < 2) pinch = null;
+    if (ptr.size === 0) {
+      if (!moved && e.type === "pointerup") {
+        const now = performance.now();
+        const dbl = now - lastTap.t < 350 && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 24;
+        const sel = selectAt(e.clientX, e.clientY);
+        if (dbl && sel) zoomToChunk(sel[0], sel[1]);
+        lastTap = dbl ? { t: 0, x: 0, y: 0 } : { t: now, x: e.clientX, y: e.clientY };
+      } else writeHashSoon();
+      start = null;
+    }
+  };
+  cv.addEventListener("pointerup", end); cv.addEventListener("pointercancel", end);
+  cv.addEventListener("wheel", (e) => {
+    if (!S.view) return;
+    e.preventDefault();
+    const r = cv.getBoundingClientRect();
+    zoomAt(Math.exp(-e.deltaY * 0.0015), (e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height);
+  }, { passive: false });
+  window.addEventListener("resize", () => render());
+})();
+$("bIn").onclick = () => S.view && zoomAt(2, 0.5, 0.5);
+$("bOut").onclick = () => S.view && zoomAt(0.5, 0.5, 0.5);
+$("bHome").onclick = () => { resetView(); render(); writeHashSoon(); };
+$("bChunk").onclick = () => { if (S.sel) zoomToChunk(S.sel[0], S.sel[1]); else status("tap a chunk first, then zoom to it (or double-tap a chunk)"); };
+$("bCoast").onclick = () => toggleCoast(!S.coastOn);
 
 function showChunk(cyI, cxI) {
   const sl = S.slice, k = cyI * sl.nx + cxI, ref = sl.refs[k], i = sl.lo + k, R = S.record;
@@ -641,10 +835,11 @@ function showChunk(cyI, cxI) {
     html += `<div class="note">the bytes, by hand:</div><pre>${esc(curl)}</pre>`;
     html += `<div class="note">the same row, by SQL:</div><pre>${esc(sql)}</pre>`;
     html += `<div class="note">the same slice, by GDAL (multidim, through the whole store):</div><pre>${esc(gd)}</pre>`;
-    html += `<div class="row"><button id="cpCurl">copy curl</button><button id="cpGdal">copy GDAL</button></div>`;
+    html += `<div class="row"><button id="zChunk">zoom to this chunk</button><button id="cpCurl">copy curl</button><button id="cpGdal">copy GDAL</button></div>`;
   }
   $("chunkInfo").innerHTML = html;
   const cp = (id, txt) => { const b = $(id); if (b) b.onclick = async () => { try { await navigator.clipboard.writeText(txt); b.textContent = "copied"; } catch (e) { b.textContent = "copy failed"; } }; };
+  if ($("zChunk")) $("zChunk").onclick = () => zoomToChunk(cyI, cxI);
   if (ref && ref.path) { cp("cpCurl", `curl -s -r ${ref.o}-${ref.o + ref.s - 1} "${ref.path}" -o chunk.bin`); cp("cpGdal", gdalLine(cidx)); }
 }
 function gdalLine(cidx) {
@@ -822,9 +1017,15 @@ function parseHash() {
   return h;
 }
 function writeHash() {
-  const h = `#store=${encodeURIComponent(S.store)}&var=${encodeURIComponent(S.v)}&idx=${S.idx.join(",")}&mode=${S.mode}`;
+  if (!S.v) return;
+  let h = `#store=${encodeURIComponent(S.store)}&var=${encodeURIComponent(S.v)}&idx=${S.idx.join(",")}&mode=${S.mode}`;
+  const g = spatialGeom();
+  if (S.view && (S.view.w < g.W - 0.5 || S.view.h < g.H - 0.5)) h += `&view=${Math.round(S.view.x)},${Math.round(S.view.y)},${Math.round(S.view.w)},${Math.round(S.view.h)}`;
+  if (S.coastOn) h += "&coast=1";
   history.replaceState(null, "", h);
 }
+let hashTimer = null;
+function writeHashSoon() { clearTimeout(hashTimer); hashTimer = setTimeout(writeHash, 300); }
 $("mBytes").onclick = () => { setMode("bytes"); writeHash(); };
 $("mVals").onclick = () => { setMode("values"); writeHash(); };
 $("store").onchange = async () => { const vars = await loadStore($("store").value); await loadVar(vars[0]); };
@@ -833,6 +1034,7 @@ $("var").onchange = () => loadVar($("var").value);
 (async function boot() {
   for (const [s, maker] of STORES) { const o = document.createElement("option"); o.value = s; o.textContent = s + "  (" + maker + ")"; $("store").append(o); }
   const h = parseHash();
+  if (h.coast === "1") { S.coastOn = true; $("bCoast").classList.add("on"); }
   if (h.mode === "values") { S.mode = "values"; $("mBytes").classList.remove("on"); $("mVals").classList.add("on"); }
   try {
     status("loading Parquet reader...");

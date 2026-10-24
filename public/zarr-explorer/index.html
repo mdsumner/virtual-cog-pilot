@@ -31,6 +31,7 @@
   main { padding: 8px 12px 40px; }
   #stage { position: relative; width: 100%; background: #0a0d10; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; touch-action: manipulation; }
   #cv { width: 100%; display: block; touch-action: none; cursor: crosshair; }
+  #sliders select { max-width: 36%; padding: 4px 6px; }
   #tools { display: flex; gap: 4px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
   #tools button { padding: 4px 10px; font-size: 13px; min-width: 34px; }
   #zoomLab { font: 11px ui-monospace, monospace; color: var(--dim); background: rgba(15,20,24,.82); padding: 3px 5px; border-radius: 4px; }
@@ -76,7 +77,8 @@
     <div id="tools">
       <button id="bIn" title="zoom in">+</button><button id="bOut" title="zoom out">&minus;</button>
       <button id="bHome" title="whole grid">all</button><button id="bChunk" title="zoom to the selected chunk">chunk</button>
-      <button id="bCoast" title="coastline overlay">coast</button><span id="zoomLab">1x</span>
+      <button id="bCoast" title="coastline overlay">coast</button><button id="bGebco" title="GEBCO 2026 contour at the current depth (lon/lat view) or seafloor along a section; reads about 15 MB of COG tiles once">GEBCO</button><span id="zoomLab">1x</span>
+      <span class="note" id="gebcoNote" style="margin:0"></span>
     </div>
   <div class="note" style="margin:4px 0 0">Drag to pan, pinch or scroll to zoom, tap a chunk to inspect it, double-tap to zoom to it.</div>
   <div id="legend"></div>
@@ -141,6 +143,13 @@
       <b>values</b> mode fetches the referenced byte ranges from THREDDS, then undoes zlib and the HDF5 shuffle filter,
       applies the fill value, scale_factor and add_offset, and draws the result. It only works if the data server allows
       cross-origin range requests from the browser.
+    </p>
+    <p class="note">
+      <b>rows / cols</b> choose any two dimensions to display (for example depth x longitude for a section);
+      the others get sliders. Zooming to a chunk also stretches the colours to that chunk; <b>all</b> resets both.
+      <b>GEBCO</b> reads the GEBCO 2026 overview on source.coop through the virtual-COG byte refs in
+      <a href="../">virtual-cog-pilot</a> (about 15 MB once, zlib and TIFF predictor undone here), then draws the
+      contour at the current depth level, or the seafloor along a depth section.
     </p>
   </div>
 </main>
@@ -363,18 +372,44 @@ function coordLabel(d, i) {
 }
 
 /* ---------- grid arithmetic ---------- */
+/* ---------- display axes: any two dimensions, sliders for the rest ---------- */
+function defaultAxes() { const nd = S.dims.length; return [nd - 2, nd - 1]; }
+function axisRole(d) {
+  const name = S.dims[d], at = (S.meta && S.meta[name + "/.zattrs"]) || {};
+  const ca = String(at.cartesian_axis || at.axis || "").toUpperCase(), u = String(at.units || "").toLowerCase(), n = name.toLowerCase();
+  if (ca === "X" || /east/.test(u) || /^(lon|longitude|x[tu]_)/.test(n)) return "X";
+  if (ca === "Y" || /north/.test(u) || /^(lat|latitude|y[tu]_)/.test(n)) return "Y";
+  if (ca === "Z" || at.positive || /^(depth|lev|s[tw]_ocean|z$)/.test(n)) return "Z";
+  if (ca === "T" || /since/.test(u)) return "T";
+  return "";
+}
+function roleDim(role) { for (let d = 0; d < S.dims.length; d++) if (axisRole(d) === role) return d; return -1; }
+function isLonLat() { return axisRole(S.ax[0]) === "Y" && axisRole(S.ax[1]) === "X"; }
+function isDefaultAxes() { const a = defaultAxes(); return S.ax[0] === a[0] && S.ax[1] === a[1]; }
+function chunkInnerStrides() { const cs = new Array(S.chunks.length); let st = 1; for (let d = S.chunks.length - 1; d >= 0; d--) { cs[d] = st; st *= S.chunks[d]; } return cs; }
+function sliceChunks() {
+  const [dy, dx] = S.ax, st = chunkStrides();
+  const cidx = S.idx.map((v, d) => Math.floor(v / S.chunks[d])); cidx[dy] = 0; cidx[dx] = 0;
+  const base = flatChunk(cidx), ny = S.nch[dy], nx = S.nch[dx];
+  const ids = new Float64Array(ny * nx);
+  for (let y = 0; y < ny; y++) for (let x = 0; x < nx; x++) ids[y * nx + x] = base + y * st[dy] + x * st[dx];
+  return { ids, ny, nx, cidx };
+}
+function setAxes(dy, dx) {
+  if (dy === dx) return;
+  S.ax = [dy, dx]; S.sel = null; S.pick = null; S.vals = null; S.chunkStretch = null;
+  resetView();
+  S.coastXY = null; if (S.coastOn && isLonLat()) ensureCoast().then(() => render());
+  buildSliders(); buildPresets(); refresh();
+}
+
 function chunkStrides() {
   const st = new Array(S.nch.length); let s = 1;
   for (let d = S.nch.length - 1; d >= 0; d--) { st[d] = s; s *= S.nch[d]; }
   return st;
 }
 function flatChunk(cidx) { const st = chunkStrides(); let i = 0; for (let d = 0; d < cidx.length; d++) i += cidx[d] * st[d]; return i; }
-function sliceRange() {
-  const nd = S.dims.length, cidx = S.idx.map((v, d) => Math.floor(v / S.chunks[d]));
-  cidx[nd - 2] = 0; cidx[nd - 1] = 0;
-  const lo = flatChunk(cidx), hi = lo + S.nch[nd - 2] * S.nch[nd - 1] - 1;
-  return { lo, hi, cidx };
-}
+function sliceRange() { return sliceChunks(); }
 
 /* ---------- variable setup ---------- */
 async function loadVar(v) {
@@ -384,7 +419,7 @@ async function loadVar(v) {
   S.nch = S.shape.map((n, d) => Math.ceil(n / S.chunks[d]));
   S.dims = S.attrs._ARRAY_DIMENSIONS || S.shape.map((_, d) => "dim_" + d);
   S.idx = S.shape.map(() => 0);
-  S.vals = null; S.sel = null; S.slice = null;
+  S.vals = null; S.sel = null; S.slice = null; S.ax = defaultAxes();
   const h = parseHash();
   if (h.idx && h.store === S.store && h.var === v) h.idx.forEach((x, d) => { if (d < S.idx.length) S.idx[d] = Math.max(0, Math.min(S.shape[d] - 1, x)); });
   status("reading coordinates");
@@ -393,7 +428,9 @@ async function loadVar(v) {
     try { const c = await loadCoord(d); if (c) S.coords[d] = c; } catch (e) { /* labels fall back to indices */ }
     if (gen !== S.gen) return;
   }
-  S.pick = null; resetView();
+  S.ax = defaultAxes();
+  if (h.ax && h.store === S.store && h.var === v) { const [y, x] = h.ax.split(",").map(Number); if (y !== x && y >= 0 && x >= 0 && y < S.dims.length && x < S.dims.length) S.ax = [y, x]; }
+  S.pick = null; S.chunkStretch = null; resetView();
   if (h.view && h.store === S.store && h.var === v) {
     const [x, y, w] = h.view.split(",").map(Number);
     const hh = h.view.split(",").map(Number)[3];
@@ -408,7 +445,22 @@ async function loadVar(v) {
 function buildSliders() {
   const box = $("sliders"); box.innerHTML = "";
   const nd = S.dims.length;
-  for (let d = 0; d < nd - 2; d++) {
+  if (nd > 2) {
+    const row = document.createElement("div"); row.className = "row"; row.style.margin = "6px 0";
+    const mk = (lab, cur, other) => {
+      const l = document.createElement("span"); l.className = "note"; l.textContent = lab;
+      const sel = document.createElement("select");
+      S.dims.forEach((d, k) => { if (S.shape[k] < 2) return; const o = document.createElement("option"); o.value = k; o.textContent = d + " (" + S.shape[k] + ")"; if (k === cur) o.selected = true; sel.append(o); });
+      return [l, sel];
+    };
+    const [ly, sy] = mk("rows", S.ax[0]), [lx, sx] = mk("cols", S.ax[1]);
+    sy.onchange = () => { const y = +sy.value; setAxes(y, y === S.ax[1] ? S.ax[0] : S.ax[1]); };
+    sx.onchange = () => { const x = +sx.value; setAxes(x === S.ax[0] ? S.ax[1] : S.ax[0], x); };
+    const sw = document.createElement("button"); sw.textContent = "swap"; sw.onclick = () => setAxes(S.ax[1], S.ax[0]);
+    row.append(ly, sy, lx, sx, sw); box.append(row);
+  }
+  for (let d = 0; d < nd; d++) {
+    if (S.ax.includes(d)) continue;
     const row = document.createElement("div"); row.className = "slider";
     const lab = document.createElement("label"); lab.textContent = S.dims[d] + " (" + S.shape[d] + ")";
     const r = document.createElement("input"); r.type = "range"; r.min = 0; r.max = S.shape[d] - 1; r.value = S.idx[d];
@@ -423,62 +475,82 @@ function buildSliders() {
 }
 
 /* ---------- the slice ---------- */
-async function loadSliceRefs() {
-  const { lo, hi } = sliceRange(), R = S.record;
-  const k0 = Math.floor(lo / R), k1 = Math.floor(hi / R);
-  const t0 = performance.now();
-  const nx = S.nch[S.nch.length - 1], ny = S.nch[S.nch.length - 2];
-  const refs = new Array(nx * ny).fill(null);
-  await Promise.all(Array.from({ length: k1 - k0 + 1 }, async (_, j) => {
-    const k = k0 + j;
-    const a = Math.max(lo, k * R) - k * R, b = Math.min(hi, k * R + R - 1) - k * R;
-    const rows = await readRows(refsUrl(k), ["path", "offset", "size", "raw"], a, b);
-    rows.forEach((r, n) => {
-      const raw = r.raw && r.raw.length ? r.raw : null;
-      refs[k * R + a + n - lo] = { path: r.path, o: r.offset, s: r.size, raw };
-    });
-  }));
-  return { lo, hi, k0, k1, refs, nx, ny, ms: performance.now() - t0 };
+async function loadSliceRefs(force) {
+  const { ids, ny, nx } = sliceChunks(), R = S.record, t0 = performance.now();
+  const byFile = new Map();
+  ids.forEach((i, n) => { const k = Math.floor(i / R); if (!byFile.has(k)) byFile.set(k, []); byFile.get(k).push(n); });
+  const ks = [...byFile.keys()].sort((a, b) => a - b);
+  if (ks.length > 6 && !force) {
+    let per = 0;
+    try { const { metadata } = await pqFile(refsUrl(0)); per = ["path", "offset", "size", "raw"].reduce((a, c) => a + columnBytes(metadata, c), 0); } catch (e) { /* estimate optional */ }
+    const err = new Error("large index read"); err.big = { files: ks.length, bytes: per * ks.length }; throw err;
+  }
+  const refs = new Array(ny * nx).fill(null), queue = ks.slice();
+  const work = async () => {
+    while (queue.length) {
+      const k = queue.shift(), ns = byFile.get(k);
+      let a = Infinity, b = -Infinity; const rowsOf = ns.map((n) => { const r = ids[n] - k * R; if (r < a) a = r; if (r > b) b = r; return r; });
+      const rows = await readRows(refsUrl(k), ["path", "offset", "size", "raw"], a, b);
+      ns.forEach((n, j) => { const r = rows[rowsOf[j] - a]; if (r) refs[n] = { path: r.path, o: r.offset, s: r.size, raw: r.raw && r.raw.length ? r.raw : null }; });
+      if (ks.length > 6) status(`reading refs: ${ks.length - queue.length}/${ks.length} files, ${fmtB(S.netBytes)} fetched`);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, ks.length) }, work));
+  return { ids, ks, refs, nx, ny, ms: performance.now() - t0 };
 }
 
-async function refresh() {
+async function refresh(force) {
   const gen = S.gen;
   writeHash();
-  status("querying refs for slice...");
+  status("reading refs for slice...");
   try {
-    const sl = await loadSliceRefs();
+    const sl = await loadSliceRefs(force === true);
     if (gen !== S.gen) return;
+    banner(null);
     S.slice = sl; S.vals = null;
     const tot = sl.refs.reduce((a, r) => a + (r && r.path ? r.s : 0), 0);
-    status(`${sl.refs.length} chunks, ${fmtB(tot)} referenced; refs.${sl.k0}${sl.k1 > sl.k0 ? "-" + sl.k1 : ""}.parq read in ${sl.ms.toFixed(0)} ms; ${fmtB(S.netBytes)} fetched this session`);
+    const kl = sl.ks.length === 1 ? `refs.${sl.ks[0]}.parq` : `${sl.ks.length} refs files`;
+    status(`${sl.refs.length} chunks, ${fmtB(tot)} referenced; ${kl} read in ${sl.ms.toFixed(0)} ms; ${fmtB(S.netBytes)} fetched this session`);
+    updateGebco();
     if (S.mode === "values") await loadValues(); else drawBytes();
-    if (S.sel) showChunk(S.sel[0], S.sel[1]);
+    if (S.sel && S.sel[0] < sl.ny && S.sel[1] < sl.nx) showChunk(S.sel[0], S.sel[1]);
     profileA();
   } catch (e) {
+    if (e.big) {
+      banner(`This view crosses <b>${e.big.files}</b> refs files (about ${fmtB(e.big.bytes)} of index to read). <button id="goBig">read them</button>`);
+      $("goBig").onclick = () => { banner(null); refresh(true); };
+      status("waiting: large index read");
+      return;
+    }
     status("error: " + e.message); console.error(e);
   }
 }
 
 function spatialGeom() {
-  const nd = S.dims.length, H = S.shape[nd - 2], W = S.shape[nd - 1];
-  const yc = S.coords[S.dims[nd - 2]];
-  const flip = yc ? yc[0] < yc[yc.length - 1] : false; // north up
-  return { H, W, flip, cy: S.chunks[nd - 2], cx: S.chunks[nd - 1] };
+  const [dy, dx] = S.ax, H = S.shape[dy], W = S.shape[dx];
+  const yc = S.coords[S.dims[dy]];
+  const flip = !!yc && axisRole(dy) === "Y" && yc[0] < yc[yc.length - 1]; // north up; depth and time run down
+  return { H, W, flip, cy: S.chunks[dy], cx: S.chunks[dx], dy, dx };
 }
 
 /* ---------- view: a window onto the base image, in display pixels (north up) ---------- */
-function resetView() { const g = spatialGeom(); S.view = { x: 0, y: 0, w: g.W, h: g.H }; }
 function maxRatio() {
   // tallest frame allowed (height / width), so a zoomed chunk can fill a phone screen
   const w = $("stage").clientWidth || 360;
   return Math.max(0.2, (window.innerHeight * 0.62) / w);
 }
+function resetView() {
+  const g = spatialGeom(), r = g.H / g.W;
+  const target = Math.min(Math.max(r, 0.4), maxRatio());
+  S.stretch = target / r;   // display stretch for thin sections such as lon x depth
+  S.view = { x: 0, y: 0, w: g.W, h: g.H };
+}
 function clampView(v) {
-  const g = spatialGeom(), mn = Math.min(g.W, g.H, 12);
+  const g = spatialGeom(), mn = Math.min(g.W, g.H, 12), st = S.stretch || 1;
   if (v.w < mn) { v.h *= mn / v.w; v.w = mn; }
-  if (v.h < mn) { v.w *= mn / v.h; v.h = mn; }
+  if (v.h < Math.min(g.H, 2)) { v.h = Math.min(g.H, 2); }
   v.w = Math.min(v.w, g.W); v.h = Math.min(v.h, g.H);
-  if (v.h / v.w > maxRatio()) v.h = v.w * maxRatio();
+  if ((v.h * st) / v.w > maxRatio()) v.h = (v.w * maxRatio()) / st;
   v.x = Math.max(0, Math.min(g.W - v.w, v.x)); v.y = Math.max(0, Math.min(g.H - v.h, v.y));
   return v;
 }
@@ -494,21 +566,25 @@ function chunkRectDisplay(cyI, cxI) {
   return { x: x0, y: g.flip ? g.H - y1 : y0, w: x1 - x0, h: y1 - y0 };
 }
 function zoomToChunk(cyI, cxI) {
-  const r = chunkRectDisplay(cyI, cxI), pad = 1.15, ratio = Math.min(r.h / r.w, maxRatio());
-  const w = Math.max(r.w * pad, (r.h * pad) / ratio), h = w * ratio;
+  const r = chunkRectDisplay(cyI, cxI), pad = 1.15, st = S.stretch || 1;
+  const ratio = Math.min((r.h * st) / r.w, maxRatio());
+  const w = Math.max(r.w * pad, (r.h * pad * st) / ratio), h = (w * ratio) / st;
   S.view = clampView({ x: r.x + r.w / 2 - w / 2, y: r.y + r.h / 2 - h / 2, w, h });
-  render(); writeHashSoon();
+  S.chunkStretch = [cyI, cxI];
+  if (S.vals) drawValues(true); else render();
+  writeHashSoon();
 }
 
 function render() {
   const cv = $("cv"); if (!S.base || !S.view) return;
   const g = spatialGeom(), v = S.view, dpr = window.devicePixelRatio || 1;
   const cssW = $("stage").clientWidth || 360;
-  cv.width = Math.round(cssW * dpr); cv.height = Math.round(cssW * dpr * v.h / v.w);
+  cv.width = Math.round(cssW * dpr); cv.height = Math.max(8, Math.round(cssW * dpr * (v.h * (S.stretch || 1)) / v.w));
   const ctx = cv.getContext("2d"), cw = cv.width, ch = cv.height;
   ctx.imageSmoothingEnabled = false;
   ctx.fillStyle = "#0a0d10"; ctx.fillRect(0, 0, cw, ch);
-  ctx.drawImage(S.base, v.x, v.y, v.w, v.h, 0, 0, cw, ch);
+  const [bsx, bsy] = S.bscale || [1, 1];
+  ctx.drawImage(S.base, v.x * bsx, v.y * bsy, v.w * bsx, v.h * bsy, 0, 0, cw, ch);
   const kx = cw / v.w, ky = ch / v.h;
   const sxOf = (x) => (x - v.x) * kx, syOf = (y) => (y - v.y) * ky;
   // chunk grid
@@ -519,7 +595,8 @@ function render() {
     for (let j = 0; j <= sl.ny; j++) { const yy = Math.min(g.H, j * g.cy), y = Math.round(syOf(g.flip ? g.H - yy : yy)) + .5; if (y < -1 || y > ch + 1) continue; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(cw, y); ctx.stroke(); }
   }
   // coastline
-  if (S.coastOn && S.coastXY) {
+  drawGebco(ctx, sxOf, syOf, g, dpr);
+  if (S.coastOn && S.coastXY && isLonLat()) {
     ctx.strokeStyle = "rgba(255,255,255,.85)"; ctx.lineWidth = Math.max(1, dpr * 0.9); ctx.lineJoin = "round";
     ctx.beginPath();
     for (const ln of S.coastXY) {
@@ -550,8 +627,13 @@ function render() {
 }
 
 function newBase() {
+  // base image in display pixels; scaled down if it would exceed what mobile canvases allow
   const g = spatialGeom();
-  if (!S.base || S.base.width !== g.W || S.base.height !== g.H) { S.base = document.createElement("canvas"); S.base.width = g.W; S.base.height = g.H; }
+  let sx = Math.min(1, 8192 / g.W), sy = Math.min(1, 8192 / g.H);
+  const area = g.W * sx * g.H * sy; if (area > 12e6) { const f = Math.sqrt(12e6 / area); sx *= f; sy *= f; }
+  const bw = Math.max(1, Math.ceil(g.W * sx)), bh = Math.max(1, Math.ceil(g.H * sy));
+  if (!S.base || S.base.width !== bw || S.base.height !== bh) { S.base = document.createElement("canvas"); S.base.width = bw; S.base.height = bh; }
+  S.bscale = [bw / g.W, bh / g.H];
   return S.base;
 }
 
@@ -559,7 +641,7 @@ function drawBytes() {
   const sl = S.slice, g = spatialGeom(), base = newBase(), ctx = base.getContext("2d");
   const sizes = sl.refs.filter((r) => r && r.path).map((r) => r.s);
   const lo = Math.log(Math.max(1, Math.min(...sizes))), hi = Math.log(Math.max(...sizes));
-  ctx.fillStyle = "#0a0d10"; ctx.fillRect(0, 0, g.W, g.H);
+  ctx.fillStyle = "#0a0d10"; ctx.fillRect(0, 0, base.width, base.height);
   const T = LUT.magma;
   for (let cyI = 0; cyI < sl.ny; cyI++) for (let cxI = 0; cxI < sl.nx; cxI++) {
     const r = sl.refs[cyI * sl.nx + cxI], rc = chunkRectDisplay(cyI, cxI);
@@ -568,7 +650,7 @@ function drawBytes() {
       const t = hi > lo ? (Math.log(r.s) - lo) / (hi - lo) : 0.5, k = Math.round(t * 255) * 3;
       ctx.fillStyle = `rgb(${T[k]},${T[k + 1]},${T[k + 2]})`;
     }
-    ctx.fillRect(rc.x, rc.y, rc.w, rc.h);
+    const [bsx, bsy] = S.bscale; ctx.fillRect(rc.x * bsx, rc.y * bsy, Math.max(1, rc.w * bsx), Math.max(1, rc.h * bsy));
   }
   render();
   legend("magma", fmtB(Math.round(Math.exp(lo))), fmtB(Math.round(Math.exp(hi))), "compressed bytes per chunk (log)");
@@ -594,7 +676,8 @@ async function ensureCoast() {
       return out;
     });
   }
-  const nd = S.dims.length, xc = S.coords[S.dims[nd - 1]], yc = S.coords[S.dims[nd - 2]];
+  if (!isLonLat()) { S.coastXY = null; return true; }
+  const xc = S.coords[S.dims[S.ax[1]]], yc = S.coords[S.dims[S.ax[0]]];
   if (!xc || !yc) { S.coastXY = null; return false; }
   const g = spatialGeom(), dx = (xc[xc.length - 1] - xc[0]) / (xc.length - 1), west = xc[0] - dx / 2;
   const global = Math.abs(dx * xc.length - 360) < 2 * Math.abs(dx);
@@ -619,6 +702,161 @@ async function toggleCoast(on) {
 }
 
 /* ---------- values ---------- */
+/* ---------- GEBCO 2026: read through the virtual-COG refs, contour in the browser ---------- */
+const GEBCO_REFS = "../gebco.kerchunk.json";   // byte refs into data.source.coop/ausantarctic/gebco/GEBCO_2026.tif
+async function ensureGebco() {
+  if (S.gebco) return S.gebco;
+  const j = JSON.parse(await getText(GEBCO_REFS)), refs = j.refs || j;
+  const za = JSON.parse(refs["elevation/.zarray"]);
+  const [H, W] = za.shape, [th, tw] = za.chunks, nty = Math.ceil(H / th), ntx = Math.ceil(W / tw);
+  const F = 2, gw = Math.floor(W / F), gh = Math.floor(H / F);   // 2x2 mean, about 0.13 degree, close to BRAN's 0.1
+  const sum = new Float32Array(gw * gh), cnt = new Uint8Array(gw * gh);
+  const keys = []; for (let ty = 0; ty < nty; ty++) for (let tx = 0; tx < ntx; tx++) keys.push([ty, tx]);
+  let done = 0, bytes = 0; const total = keys.length;
+  const work = async () => {
+    while (keys.length) {
+      const [ty, tx] = keys.shift(), ref = refs[`elevation/${ty}.${tx}`];
+      if (!Array.isArray(ref)) { done++; continue; }
+      const buf = await rangeGet(ref[0], ref[1], ref[2]); bytes += buf.byteLength;
+      const raw = await inflate(new Uint8Array(buf), "deflate");
+      const a = new Int16Array(raw.buffer, raw.byteOffset, (raw.byteLength >> 1));
+      // TIFF predictor 2: horizontal differencing per row, on int16 samples
+      for (let r = 0; r < th; r++) { const o = r * tw; for (let c = 1; c < tw; c++) a[o + c] += a[o + c - 1]; }
+      for (let r = 0; r < th; r++) {
+        const y = ty * th + r; if (y >= gh * F) break;
+        const gy = (y / F) | 0;
+        for (let c = 0; c < tw; c++) {
+          const x = tx * tw + c; if (x >= gw * F) break;
+          const v = a[r * tw + c]; if (v === za.fill_value) continue;
+          const k = gy * gw + ((x / F) | 0); sum[k] += v; cnt[k]++;
+        }
+      }
+      done++; status(`GEBCO 2026: ${done}/${total} tiles, ${fmtB(bytes)} from source.coop`);
+    }
+  };
+  await Promise.all(Array.from({ length: 6 }, work));
+  const grid = new Float32Array(gw * gh);
+  for (let k = 0; k < grid.length; k++) grid[k] = cnt[k] ? sum[k] / cnt[k] : NaN;
+  S.gebco = { grid, gw, gh, cache: new Map(), bytes };
+  return S.gebco;
+}
+function gebcoAt(lon, lat) {
+  const G = S.gebco; lon = ((((lon + 180) % 360) + 360) % 360) - 180;
+  const fx = ((lon + 180) * G.gw) / 360 - 0.5, fy = ((90 - lat) * G.gh) / 180 - 0.5;
+  const x0 = Math.max(0, Math.min(G.gw - 2, Math.floor(fx))), y0 = Math.max(0, Math.min(G.gh - 2, Math.floor(fy)));
+  const tx = Math.max(0, Math.min(1, fx - x0)), ty = Math.max(0, Math.min(1, fy - y0)), g = G.grid, w = G.gw;
+  const a = g[y0 * w + x0], b = g[y0 * w + x0 + 1], c = g[(y0 + 1) * w + x0], d = g[(y0 + 1) * w + x0 + 1];
+  return (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty;
+}
+function marching(grid, gw, gh, L) {
+  // marching squares; returns segments in grid cell-centre coordinates [x1,y1,x2,y2,...]
+  const out = [];
+  for (let y = 0; y < gh - 1; y++) {
+    for (let x = 0; x < gw - 1; x++) {
+      const a = grid[y * gw + x], b = grid[y * gw + x + 1], c = grid[(y + 1) * gw + x + 1], d = grid[(y + 1) * gw + x];
+      if (a !== a || b !== b || c !== c || d !== d) continue;
+      const k = (a > L ? 8 : 0) | (b > L ? 4 : 0) | (c > L ? 2 : 0) | (d > L ? 1 : 0);
+      if (k === 0 || k === 15) continue;
+      const T = () => [x + (L - a) / (b - a), y], R = () => [x + 1, y + (L - b) / (c - b)];
+      const B = () => [x + (L - d) / (c - d), y + 1], Lf = () => [x, y + (L - a) / (d - a)];
+      const seg = (p, q) => out.push(p[0], p[1], q[0], q[1]);
+      switch (k) {
+        case 1: case 14: seg(Lf(), B()); break;
+        case 2: case 13: seg(B(), R()); break;
+        case 3: case 12: seg(Lf(), R()); break;
+        case 4: case 11: seg(T(), R()); break;
+        case 5: seg(Lf(), T()); seg(B(), R()); break;
+        case 6: case 9: seg(T(), B()); break;
+        case 7: case 8: seg(Lf(), T()); break;
+        case 10: seg(T(), R()); seg(Lf(), B()); break;
+      }
+    }
+  }
+  return out;
+}
+function lonLatMapper() {
+  // lon/lat -> display pixel coords for the current lon/lat axes
+  const g = spatialGeom(), xc = S.coords[S.dims[S.ax[1]]], yc = S.coords[S.dims[S.ax[0]]];
+  if (!xc || !yc) return null;
+  const dx = (xc[xc.length - 1] - xc[0]) / (xc.length - 1), west = xc[0] - dx / 2;
+  const global = Math.abs(dx * xc.length - 360) < 2 * Math.abs(dx);
+  const ylo = Math.min(yc[0], yc[yc.length - 1]) - 1, yhi = Math.max(yc[0], yc[yc.length - 1]) + 1;
+  return (lon, lat) => {
+    if (lat < ylo || lat > yhi) return null;
+    if (global) lon = west + ((((lon - west) % 360) + 360) % 360);
+    const fy = frac(yc, lat) + 0.5;
+    return [frac(xc, lon) + 0.5, g.flip ? g.H - fy : fy];
+  };
+}
+function updateGebco() {
+  S.gebcoDraw = null; $("gebcoNote").textContent = "";
+  if (!S.gebcoOn || !S.gebco) return;
+  const G = S.gebco, g = spatialGeom(), zd = roleDim("Z");
+  if (isLonLat()) {
+    const zc = zd >= 0 ? S.coords[S.dims[zd]] : null;
+    const depth = zc ? zc[S.idx[zd]] : 0, L = -depth;
+    const key = S.v + "|" + S.store + "|" + L.toFixed(3);
+    let segs = G.cache.get(key);
+    if (!segs) {
+      const raw = marching(G.grid, G.gw, G.gh, L), map = lonLatMapper();
+      if (!map) return;
+      const out = [];
+      for (let i = 0; i < raw.length; i += 4) {
+        const p = map(-180 + ((raw[i] + 0.5) * 360) / G.gw, 90 - ((raw[i + 1] + 0.5) * 180) / G.gh);
+        const q = map(-180 + ((raw[i + 2] + 0.5) * 360) / G.gw, 90 - ((raw[i + 3] + 0.5) * 180) / G.gh);
+        if (!p || !q || Math.abs(p[0] - q[0]) > g.W / 2) continue;
+        out.push(p[0], p[1], q[0], q[1]);
+      }
+      segs = new Float32Array(out); G.cache.set(key, segs);
+    }
+    S.gebcoDraw = { type: "seg", xy: segs };
+    $("gebcoNote").textContent = `GEBCO 2026 contour at ${depth === 0 ? "0 m" : "-" + depth.toFixed(1) + " m"}`;
+    return;
+  }
+  // a depth section: rows are Z, columns are lon or lat, the other horizontal axis fixed by its slider
+  const [dy, dx] = S.ax, rx = axisRole(dx);
+  if (axisRole(dy) !== "Z" || (rx !== "X" && rx !== "Y")) { $("gebcoNote").textContent = "GEBCO: needs lat x lon, or a depth section"; return; }
+  const other = roleDim(rx === "X" ? "Y" : "X"), zc = S.coords[S.dims[dy]], hc = S.coords[S.dims[dx]];
+  const oc = other >= 0 ? S.coords[S.dims[other]] : null;
+  if (!zc || !hc || !oc) return;
+  const fixed = oc[S.idx[other]], xy = new Float32Array(hc.length * 2);
+  for (let i = 0; i < hc.length; i++) {
+    const e = rx === "X" ? gebcoAt(hc[i], fixed) : gebcoAt(fixed, hc[i]);
+    const dep = Math.max(0, -e);
+    xy[i * 2] = i + 0.5; xy[i * 2 + 1] = Math.min(g.H, frac(zc, dep) + 0.5);
+  }
+  S.gebcoDraw = { type: "floor", xy };
+  $("gebcoNote").textContent = `GEBCO 2026 seafloor along ${S.dims[other]} = ${fixed.toFixed(2)}`;
+}
+function drawGebco(ctx, sxOf, syOf, g, dpr) {
+  const D = S.gebcoDraw; if (!S.gebcoOn || !D) return;
+  ctx.save();
+  if (D.type === "seg") {
+    ctx.strokeStyle = "rgba(255,168,64,.95)"; ctx.lineWidth = 1.3 * dpr; ctx.beginPath();
+    const xy = D.xy;
+    for (let i = 0; i < xy.length; i += 4) { ctx.moveTo(sxOf(xy[i]), syOf(xy[i + 1])); ctx.lineTo(sxOf(xy[i + 2]), syOf(xy[i + 3])); }
+    ctx.stroke();
+  } else {
+    const xy = D.xy, n = xy.length / 2;
+    ctx.beginPath(); ctx.moveTo(sxOf(xy[0]), syOf(g.H));
+    for (let i = 0; i < n; i++) ctx.lineTo(sxOf(xy[i * 2]), syOf(xy[i * 2 + 1]));
+    ctx.lineTo(sxOf(xy[(n - 1) * 2]), syOf(g.H)); ctx.closePath();
+    ctx.fillStyle = "rgba(92,66,40,.55)"; ctx.fill();
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) { const X = sxOf(xy[i * 2]), Y = syOf(xy[i * 2 + 1]); if (i) ctx.lineTo(X, Y); else ctx.moveTo(X, Y); }
+    ctx.strokeStyle = "rgba(255,168,64,.95)"; ctx.lineWidth = 1.5 * dpr; ctx.stroke();
+  }
+  ctx.restore();
+}
+async function toggleGebco(on) {
+  S.gebcoOn = on; $("bGebco").classList.toggle("on", on);
+  if (on) {
+    try { await ensureGebco(); }
+    catch (e) { status("GEBCO failed: " + e.message); S.gebcoOn = false; $("bGebco").classList.remove("on"); }
+  }
+  updateGebco(); render(); writeHashSoon();
+}
+
 async function rangeGet(url, off, len) {
   const r = await fetch(url, { headers: { Range: `bytes=${off}-${off + len - 1}` } });
   if (!(r.status === 206 || r.status === 200)) throw new Error("HTTP " + r.status);
@@ -633,15 +871,24 @@ function unpackInfo() {
   return { fills, scale, off };
 }
 function innerOffset() {
-  // position of the current non-spatial indices inside a chunk
-  const nd = S.dims.length; let o = 0, s = 1;
-  const local = S.idx.map((v, d) => v % S.chunks[d]);
-  for (let d = nd - 1; d >= 0; d--) { if (d < nd - 2) o += local[d] * s; s *= S.chunks[d]; }
+  // position of the slider indices inside a chunk
+  const cs = chunkInnerStrides(); let o = 0;
+  S.idx.forEach((v, d) => { if (!S.ax.includes(d)) o += (v % S.chunks[d]) * cs[d]; });
   return o;
 }
 
-async function loadValues() {
+async function loadValues(force) {
   const gen = S.gen, sl = S.slice, g = spatialGeom();
+  const nref = sl.refs.filter((r) => r && (r.path || r.raw));
+  if (nref.length > 360 && force !== true) {
+    const tot = nref.reduce((a, r) => a + (r.s || 0), 0);
+    banner(`This view needs <b>${nref.length}</b> chunks (${fmtB(tot)}) from the data server. <button id="goVals">fetch them</button> <button id="noVals">show bytes</button>`);
+    $("goVals").onclick = () => { banner(null); loadValues(true); };
+    $("noVals").onclick = () => { banner(null); setMode("bytes"); };
+    drawBytes(); return;
+  }
+  if (g.W * g.H > 40e6) { status("this view is too large to decode in the browser; showing bytes"); drawBytes(); return; }
+  const cs = chunkInnerStrides(), csy = cs[g.dy], csx = cs[g.dx];
   const vals = new Float32Array(g.W * g.H).fill(NaN);
   S.vals = vals;
   const U = unpackInfo(), inner = innerOffset();
@@ -665,7 +912,7 @@ async function loadValues() {
         const cyI = Math.floor(k / sl.nx), cxI = k % sl.nx;
         const y0 = cyI * g.cy, x0 = cxI * g.cx;
         for (let yy = 0; yy < g.cy && y0 + yy < g.H; yy++) for (let xx = 0; xx < g.cx && x0 + xx < g.W; xx++) {
-          let v = Number(arr[inner + yy * g.cx + xx]);
+          let v = Number(arr[inner + yy * csy + xx * csx]);
           if (U.fills.includes(v)) v = NaN; else v = v * U.scale + U.off;
           vals[(y0 + yy) * g.W + x0 + xx] = v;
         }
@@ -699,17 +946,25 @@ function drawValues(final) {
   const g = spatialGeom();
   if (final || !S.range) {
     const smp = [];
-    const step = Math.max(1, Math.floor(vals.length / 200000));
-    for (let i = 0; i < vals.length; i += step) if (Number.isFinite(vals[i])) smp.push(vals[i]);
+    if (S.chunkStretch) {
+      // colours stretched to the zoomed chunk only
+      const [cyI, cxI] = S.chunkStretch, y0 = cyI * g.cy, x0 = cxI * g.cx;
+      for (let y = y0; y < Math.min(g.H, y0 + g.cy); y++) for (let x = x0; x < Math.min(g.W, x0 + g.cx); x++) { const v = vals[y * g.W + x]; if (Number.isFinite(v)) smp.push(v); }
+    }
+    if (!smp.length) {
+      const step = Math.max(1, Math.floor(vals.length / 200000));
+      for (let i = 0; i < vals.length; i += step) if (Number.isFinite(vals[i])) smp.push(vals[i]);
+    }
     if (smp.length) { smp.sort((a, b) => a - b); S.range = [smp[Math.floor(smp.length * 0.01)], smp[Math.floor(smp.length * 0.99)]]; }
   }
   const [lo, hi] = S.range || [0, 1];
-  const W = g.W, H = g.H, base = newBase();
-  const fctx = base.getContext("2d"), im = fctx.createImageData(W, H), T = LUT.viridis, d = im.data;
-  for (let y = 0; y < H; y++) {
-    const yy = g.flip ? H - 1 - y : y;
-    for (let x = 0; x < W; x++) {
-      const v = vals[yy * W + x], p = (y * W + x) * 4;
+  const W = g.W, H = g.H, base = newBase(), BW = base.width, BH = base.height;
+  const fctx = base.getContext("2d"), im = fctx.createImageData(BW, BH), T = LUT.viridis, d = im.data;
+  for (let by = 0; by < BH; by++) {
+    const y = Math.min(H - 1, Math.floor((by + 0.5) * H / BH)), yy = g.flip ? H - 1 - y : y;
+    for (let bx = 0; bx < BW; bx++) {
+      const x = Math.min(W - 1, Math.floor((bx + 0.5) * W / BW));
+      const v = vals[yy * W + x], p = (by * BW + bx) * 4;
       if (!Number.isFinite(v)) { d[p] = 26; d[p + 1] = 30; d[p + 2] = 34; d[p + 3] = 255; continue; }
       let t = (v - lo) / (hi - lo); t = t < 0 ? 0 : t > 1 ? 1 : t;
       const k = Math.round(t * 255) * 3; d[p] = T[k]; d[p + 1] = T[k + 1]; d[p + 2] = T[k + 2]; d[p + 3] = 255;
@@ -718,7 +973,7 @@ function drawValues(final) {
   fctx.putImageData(im, 0, 0);
   render();
   const u = S.attrs.units || "";
-  legend("viridis", lo.toPrecision(4), hi.toPrecision(4), (S.attrs.long_name || S.v) + (u ? " (" + u + ")" : "") + ", 1-99%");
+  legend("viridis", lo.toPrecision(4), hi.toPrecision(4), (S.attrs.long_name || S.v) + (u ? " (" + u + ")" : "") + (S.chunkStretch ? ", 1-99% of chunk (" + S.chunkStretch.join(", ") + "); 'all' resets" : ", 1-99% of slice"));
 }
 
 function setMode(m) {
@@ -803,13 +1058,14 @@ function selectAt(clientX, clientY) {
 })();
 $("bIn").onclick = () => S.view && zoomAt(2, 0.5, 0.5);
 $("bOut").onclick = () => S.view && zoomAt(0.5, 0.5, 0.5);
-$("bHome").onclick = () => { resetView(); render(); writeHashSoon(); };
+$("bHome").onclick = () => { resetView(); const had = S.chunkStretch; S.chunkStretch = null; if (had && S.vals) drawValues(true); else render(); writeHashSoon(); };
 $("bChunk").onclick = () => { if (S.sel) zoomToChunk(S.sel[0], S.sel[1]); else status("tap a chunk first, then zoom to it (or double-tap a chunk)"); };
 $("bCoast").onclick = () => toggleCoast(!S.coastOn);
+$("bGebco").onclick = () => toggleGebco(!S.gebcoOn);
 
 function showChunk(cyI, cxI) {
-  const sl = S.slice, k = cyI * sl.nx + cxI, ref = sl.refs[k], i = sl.lo + k, R = S.record;
-  const nd = S.dims.length, cidx = sliceRange().cidx; cidx[nd - 2] = cyI; cidx[nd - 1] = cxI;
+  const sl = S.slice, k = cyI * sl.nx + cxI, ref = sl.refs[k], i = sl.ids[k], R = S.record;
+  const cidx = sliceChunks().cidx.slice(); cidx[S.ax[0]] = cyI; cidx[S.ax[1]] = cxI;
   const rows = [];
   rows.push(["chunk", "(" + cidx.join(", ") + ")  of grid (" + S.nch.join(", ") + ")"]);
   rows.push(["flat index i", i.toLocaleString("en")]);
@@ -823,7 +1079,7 @@ function showChunk(cyI, cxI) {
   } else rows.push(["ref", ref && ref.raw ? "inline bytes" : "no reference (missing chunk)"]);
   if (S.pick && S.vals) {
     const g = spatialGeom(), v = S.vals[S.pick[0] * g.W + S.pick[1]];
-    const xn = S.dims[nd - 1], yn = S.dims[nd - 2];
+    const xn = S.dims[S.ax[1]], yn = S.dims[S.ax[0]];
     const xl = S.coords[xn] ? S.coords[xn][S.pick[1]].toFixed(3) : S.pick[1], yl = S.coords[yn] ? S.coords[yn][S.pick[0]].toFixed(3) : S.pick[0];
     rows.push(["value at tap", (Number.isFinite(v) ? v.toPrecision(5) : "NA") + `  at ${xn}=${xl}, ${yn}=${yl}`]);
   }
@@ -843,8 +1099,7 @@ function showChunk(cyI, cxI) {
   if (ref && ref.path) { cp("cpCurl", `curl -s -r ${ref.o}-${ref.o + ref.s - 1} "${ref.path}" -o chunk.bin`); cp("cpGdal", gdalLine(cidx)); }
 }
 function gdalLine(cidx) {
-  const nd = S.dims.length;
-  const sub = S.dims.map((d, k) => k < nd - 2 ? String(S.idx[k]) : `${cidx[k] * S.chunks[k]}:${Math.min(S.shape[k], (cidx[k] + 1) * S.chunks[k])}`).join(",");
+  const sub = S.dims.map((d, k) => !S.ax.includes(k) ? String(S.idx[k]) : `${cidx[k] * S.chunks[k]}:${Math.min(S.shape[k], (cidx[k] + 1) * S.chunks[k])}`).join(",");
   return `gdal mdim convert --array=${S.v} --subset-view="[${sub}]" "/vsicurl/${BASE}${S.store}" chunk.tif`;
 }
 
@@ -867,7 +1122,10 @@ function barChart(id, values, labels, cur, onPick, color) {
 async function profileA() {
   // bytes per index of the dimension just before the spatial pair, for the current position in the others
   const nd = S.dims.length;
-  if (nd < 4) { $("profA").innerHTML = ""; $("chartA").style.display = "none"; $("profANote").textContent = ""; return; }
+  if (nd < 4 || !isDefaultAxes()) {
+    $("profA").innerHTML = nd >= 4 ? '<span class="note">the depth byte profile is shown for the default (lat x lon) axes</span>' : "";
+    $("chartA").style.display = "none"; $("profANote").textContent = ""; return;
+  }
   $("chartA").style.display = "block";
   const d = nd - 3, gen = S.gen;
   const cidx = S.idx.map((v, k) => Math.floor(v / S.chunks[k])); cidx[d] = 0; cidx[nd - 2] = 0; cidx[nd - 1] = 0;
@@ -883,10 +1141,10 @@ async function profileA() {
       nrow += rows.length;
     }
     if (gen !== S.gen) return;
-    const res = { rows: { length: nrow }, ms: performance.now() - t0 };
+    const ms = performance.now() - t0;
     const labs = vals.map((_, c) => coordLabel(d, Math.min(S.shape[d] - 1, c * S.chunks[d])));
     barChart("chartA", vals, labs, Math.floor(S.idx[d] / S.chunks[d]), (c) => { S.idx[d] = c * S.chunks[d]; buildSliders(); refresh(); }, "#7d5aa6");
-    $("profANote").textContent = `Total compressed bytes of each ${S.dims[d]} slab, summed from ${res.rows.length} refs rows in ${res.ms.toFixed(0)} ms. Tap a bar to go there. Fewer bytes usually means more land (fill) or smoother fields.`;
+    $("profANote").textContent = `Total compressed bytes of each ${S.dims[d]} slab, summed from ${nrow} refs rows in ${ms.toFixed(0)} ms. Tap a bar to go there. Fewer bytes usually means more land (fill) or smoother fields.`;
   } catch (e) { $("profANote").textContent = "profile failed: " + e.message; }
 }
 
@@ -933,17 +1191,16 @@ function viewSql(name, urls) {
 }
 async function ensureViews() {
   const total = S.nch.reduce((a, b) => a * b, 1), nf = Math.ceil(total / S.record);
-  const sl = S.slice || await loadSliceRefs();
-  const here = []; for (let k = sl.k0; k <= sl.k1; k++) here.push(refsUrl(k));
-  await q(viewSql("refs_here", here));
+  const sl = S.slice || await loadSliceRefs(true);
+  await q(viewSql("refs_here", sl.ks.map((k) => refsUrl(k))));
   await q(viewSql("refs", Array.from({ length: nf }, (_, k) => refsUrl(k))));
 }
 function buildPresets() {
   const box = $("presets"); box.innerHTML = "";
-  const { lo, hi } = sliceRange();
   const nd = S.dims.length, d0 = S.dims[0];
+  const fixed = S.dims.map((d, k) => S.ax.includes(k) ? null : `"${d}_c" = ${Math.floor(S.idx[k] / S.chunks[k])}`).filter(Boolean);
   const P = [
-    ["slice on screen", `select * from refs_here\nwhere i between ${lo} and ${hi}\norder by size desc;`],
+    ["slice on screen", `select * from refs_here\n${fixed.length ? "where " + fixed.join("\n  and ") + "\n" : ""}order by size desc;`],
     ["source files", `select path, count(*) chunks, sum(size) bytes,\n  min("offset") first_byte, max("offset" + size) last_byte\nfrom refs_here group by path order by path;`],
     ["size histogram", `select (size // 10000) * 10 as kB_bin, count(*) n\nfrom refs_here group by 1 order by 1;`],
     ["whole store by file", `-- reads every refs file for this variable\nselect regexp_extract(path, '[^/]+$') file, count(*) chunks,\n  round(sum(size) / 1e6, 1) MB\nfrom refs group by 1 order by 1;`],
@@ -1021,7 +1278,9 @@ function writeHash() {
   let h = `#store=${encodeURIComponent(S.store)}&var=${encodeURIComponent(S.v)}&idx=${S.idx.join(",")}&mode=${S.mode}`;
   const g = spatialGeom();
   if (S.view && (S.view.w < g.W - 0.5 || S.view.h < g.H - 0.5)) h += `&view=${Math.round(S.view.x)},${Math.round(S.view.y)},${Math.round(S.view.w)},${Math.round(S.view.h)}`;
+  if (S.ax && !isDefaultAxes()) h += `&ax=${S.ax[0]},${S.ax[1]}`;
   if (S.coastOn) h += "&coast=1";
+  if (S.gebcoOn) h += "&gebco=1";
   history.replaceState(null, "", h);
 }
 let hashTimer = null;
@@ -1035,6 +1294,7 @@ $("var").onchange = () => loadVar($("var").value);
   for (const [s, maker] of STORES) { const o = document.createElement("option"); o.value = s; o.textContent = s + "  (" + maker + ")"; $("store").append(o); }
   const h = parseHash();
   if (h.coast === "1") { S.coastOn = true; $("bCoast").classList.add("on"); }
+  if (h.gebco === "1") { S.gebcoOn = true; $("bGebco").classList.add("on"); }
   if (h.mode === "values") { S.mode = "values"; $("mBytes").classList.remove("on"); $("mVals").classList.add("on"); }
   try {
     status("loading Parquet reader...");

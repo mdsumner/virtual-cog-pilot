@@ -68,10 +68,15 @@
     <select id="var" title="variable"></select>
     <button id="mBytes" class="on" title="colour chunks by compressed byte size, from the index alone">bytes</button>
     <button id="mVals" title="fetch referenced byte ranges from THREDDS and decode">values</button>
+    <span class="note" style="margin:0 0 0 6px">refs via</span>
+    <button id="eHyp" class="on" title="read refs with hyparquet: footer plus row window (light)">hyparquet</button>
+    <button id="eSql" title="query refs with DuckDB-Wasm SQL; the query is shown below">DuckDB SQL</button>
   </div>
   <div id="status">starting...</div>
 </header>
 <div id="banner"></div>
+<details id="sqlShown" style="display:none;margin:6px 12px 0"><summary class="note" style="cursor:pointer">SQL behind this view</summary>
+  <pre id="sqlShownText"></pre><div class="row"><button id="sqlToTab">open in SQL tab</button><span class="note" id="sqlShownNote"></span></div></details>
 <main>
   <div id="stage"><canvas id="cv" width="12" height="5"></canvas></div>
     <div id="tools">
@@ -81,8 +86,19 @@
       <span class="note" id="gebcoNote" style="margin:0"></span>
     </div>
     <div class="row" style="margin-top:6px">
-      <span class="note" style="margin:0">view</span><select id="projSel" title="reproject the view; the data stay as stored"></select>
+      <span class="note" style="margin:0">view</span><select id="projSel" title="reproject the view; the data stay as stored" style="flex:1 1 auto;min-width:0;max-width:80%"></select>
       <input id="projStr" type="text" spellcheck="false" style="display:none;flex:1 1 220px;font:12px ui-monospace,monospace" placeholder="+proj=ortho +lat_0={lat0} +lon_0={lon0} +R=6371000">
+    </div>
+    <div id="projCtl" style="display:none;margin-top:6px">
+      <div class="row">
+        <span class="note" style="margin:0">centre</span>
+        <input id="cLon" type="text" inputmode="decimal" style="width:76px" title="centre longitude">
+        <input id="cLat" type="text" inputmode="decimal" style="width:70px" title="centre latitude">
+        <button id="cSet">set</button><button id="cPick" title="centre on the tapped point">tapped point</button>
+        <span class="note" style="margin:0">reach</span>
+        <input id="cReach" type="text" inputmode="decimal" style="width:52px" title="degrees from the centre covered by the initial extent; empty for the whole data extent"><span class="note" style="margin:0">deg</span>
+      </div>
+      <div class="note mono" id="projStrShown" style="margin:4px 0 0;word-break:break-all"></div>
     </div>
   <div class="note" style="margin:4px 0 0">Drag to pan, pinch or scroll to zoom, tap a chunk to inspect it, double-tap to zoom to it (in a reprojected view, double-tap re-centres the projection there).</div>
   <div id="legend"></div>
@@ -151,8 +167,17 @@
       cross-origin range requests from the browser.
     </p>
     <p class="note">
+      <b>refs via</b> switches how the reference rows are read. <b>hyparquet</b> reads the Parquet footer and a
+      row window directly. <b>DuckDB SQL</b> runs the slice as a SQL query over the same refs files (shown under
+      the status line): row windows per file, chunk coordinates computed from the flat index, and predicates on the
+      dimensions held fixed by the sliders. The map, bytes and values are identical either way.
+    </p>
+    <p class="note">
       <b>view</b> reprojects the display into any PROJ projection (orthographic globe, polar stereographic,
-      Equal Earth, or a custom PROJ string with optional {lon0} and {lat0}). The data are not resampled or
+      Equal Earth, UTM, Lambert conic, EPSG polar and regional grids, or a custom PROJ string with optional
+      {lon0}, {lat0}, {zone} and {south}). Centred presets take a centre (type it, use the tapped point, or
+      double-tap); <b>reach</b> caps the initial extent to a great-circle distance from the centre or pole, so polar
+      and azimuthal views do not stretch out to the whole globe. The data are not resampled or
       copied: each screen pixel is inverse-projected back to the grid as it is stored, using a coarse mesh of
       exact inverses interpolated within cells (exact per pixel along the limb and wraps). Chunk boundaries,
       coastline, GEBCO contours and the selected chunk are forward-projected over it, so you can see what a
@@ -169,7 +194,8 @@
 </main>
 
 <script type="module">
-const DUCK = "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.32.0/+esm";
+// 1.28 has Parquet built in, so no extension download on first query
+const DUCK = "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.28.0/+esm";
 const HYPARQUET = "https://cdn.jsdelivr.net/npm/hyparquet@1.31.5/+esm";
 const HYPARQUET_COMP = "https://cdn.jsdelivr.net/npm/hyparquet-compressors@1.1.2/+esm";
 const BASE = "https://raw.githubusercontent.com/mdsumner/virtualized/refs/heads/main/";
@@ -441,7 +467,7 @@ async function loadVar(v) {
   S.ax = defaultAxes();
   if (h.ax && h.store === S.store && h.var === v) { const [y, x] = h.ax.split(",").map(Number); if (y !== x && y >= 0 && x >= 0 && y < S.dims.length && x < S.dims.length) S.ax = [y, x]; }
   S.pick = null; S.chunkStretch = null; S.base = null; S.baseData = null;
-  if (S.proj) { if (isLonLat()) await setProjection(S.proj.key, { center: S.proj.center, str: S.proj.tpl }); else { S.proj = null; $("projSel").value = "native"; } }
+  if (S.proj) { if (isLonLat()) await setProjection(S.proj.key, { center: S.proj.center, str: S.proj.tpl, reach: S.proj.reach }); else { S.proj = null; $("projSel").value = "native"; } }
   resetView();
   if (h.view && h.store === S.store && h.var === v) {
     const [x, y, w] = h.view.split(",").map(Number);
@@ -487,7 +513,46 @@ function buildSliders() {
 }
 
 /* ---------- the slice ---------- */
+function sliceSql(ks, byFile, ids) {
+  // the Zarr slice as SQL: row windows per refs file, chunk coordinates from the flat index, predicates on the fixed dims
+  const R = S.record, st = chunkStrides(), [dy, dx] = S.ax;
+  const parts = ks.map((k) => {
+    let a = Infinity, b = -Infinity; for (const n of byFile.get(k)) { const r = ids[n] - k * R; if (r < a) a = r; if (r > b) b = r; }
+    return `  select file_row_number + ${k * R} as i, path, "offset", size, raw\n  from read_parquet('${refsUrl(k)}', file_row_number = true)\n  where file_row_number between ${a} and ${b}`;
+  });
+  const cols = S.dims.map((d, j) => `(i // ${st[j]}) % ${S.nch[j]} as "${d}_c"`).join(",\n         ");
+  const fixed = S.dims.map((d, j) => (S.ax.includes(j) ? null : `"${d}_c" = ${Math.floor(S.idx[j] / S.chunks[j])}`)).filter(Boolean);
+  return `-- ${S.v} in ${S.store}: one row per chunk on screen\nwith refs as (\n${parts.join("\n  union all\n")}\n),\ngrid as (\n  select i,\n         ${cols},\n         path, "offset", size, raw\n  from refs\n)\nselect "${S.dims[dy]}_c"::INTEGER as cy, "${S.dims[dx]}_c"::INTEGER as cx, path, "offset"::DOUBLE as o, size::DOUBLE as s, raw\nfrom grid\nwhere ${fixed.length ? fixed.join("\n  and ") : "true"}\norder by cy, cx;`;
+}
+async function loadSliceRefsSql(force) {
+  const { ids, ny, nx } = sliceChunks(), R = S.record, t0 = performance.now();
+  const byFile = new Map();
+  ids.forEach((i, n) => { const k = Math.floor(i / R); if (!byFile.has(k)) byFile.set(k, []); byFile.get(k).push(n); });
+  const ks = [...byFile.keys()].sort((a, b) => a - b);
+  if (ks.length > 6 && !force) { const err = new Error("large index read"); err.big = { files: ks.length, bytes: 0 }; throw err; }
+  if (!conn) { status("loading DuckDB-Wasm (once)..."); await initDuck(); }
+  const sql = sliceSql(ks, byFile, ids);
+  $("sqlShownText").textContent = sql; S.lastSliceSql = sql;
+  const res = await q(sql);
+  const refs = new Array(ny * nx).fill(null);
+  for (const r of res.rows) {
+    const raw = r.raw && r.raw.length ? r.raw : null;
+    refs[r.cy * nx + r.cx] = { path: r.path, o: Number(r.o), s: Number(r.s), raw };
+  }
+  $("sqlShownNote").textContent = `${res.rows.length} rows in ${res.ms.toFixed(0)} ms (DuckDB-Wasm)`;
+  return { ids, ks, refs, nx, ny, ms: performance.now() - t0, sql: true };
+}
+function setEngine(e) {
+  S.engine = e;
+  $("eHyp").classList.toggle("on", e !== "sql"); $("eSql").classList.toggle("on", e === "sql");
+  $("sqlShown").style.display = e === "sql" ? "" : "none";
+  writeHashSoon();
+}
 async function loadSliceRefs(force) {
+  if (S.engine === "sql") {
+    try { return await loadSliceRefsSql(force); }
+    catch (e) { if (e.big) throw e; S.lastSqlError = e.message; console.error(e); banner("DuckDB SQL failed, so this view used hyparquet: " + esc(e.message)); setEngine("hyp"); }
+  }
   const { ids, ny, nx } = sliceChunks(), R = S.record, t0 = performance.now();
   const byFile = new Map();
   ids.forEach((i, n) => { const k = Math.floor(i / R); if (!byFile.has(k)) byFile.set(k, []); byFile.get(k).push(n); });
@@ -521,7 +586,7 @@ async function refresh(force) {
     banner(null);
     S.slice = sl; S.vals = null;
     const tot = sl.refs.reduce((a, r) => a + (r && r.path ? r.s : 0), 0);
-    const kl = sl.ks.length === 1 ? `refs.${sl.ks[0]}.parq` : `${sl.ks.length} refs files`;
+    const kl = (sl.ks.length === 1 ? `refs.${sl.ks[0]}.parq` : `${sl.ks.length} refs files`) + (sl.sql ? " via DuckDB SQL" : "");
     status(`${sl.refs.length} chunks, ${fmtB(tot)} referenced; ${kl} read in ${sl.ms.toFixed(0)} ms; ${fmtB(S.netBytes)} fetched this session`);
     updateGebco();
     if (S.mode === "values") await loadValues(); else drawBytes();
@@ -594,20 +659,65 @@ function zoomToChunk(cyI, cxI) {
 // ortho-cog-viewer), interpolated inside cells, with exact per-pixel inverses where the mesh
 // breaks (globe limb, dateline wrap, data edge). Overlays are forward-projected and cached.
 const PROJ4 = "https://cdn.jsdelivr.net/npm/proj4@2.22.0/+esm";
+// centre: "both" (lon0, lat0), "lon" (lon0 only), "none" (fixed CRS). reach: degrees of great-circle
+// distance from rc (the reach centre) that the initial extent covers; null for whole-data extent.
 const PROJS = [
-  ["native", "native grid", null],
-  ["ortho", "orthographic (globe)", "+proj=ortho +lat_0={lat0} +lon_0={lon0} +R=6371000 +units=m"],
-  ["aeqd", "azimuthal equidistant", "+proj=aeqd +lat_0={lat0} +lon_0={lon0} +R=6371000 +units=m"],
-  ["spstere", "south polar stereographic", "+proj=stere +lat_0=-90 +lat_ts=-71 +lon_0={lon0} +datum=WGS84 +units=m"],
-  ["robin", "Robinson", "+proj=robin +lon_0={lon0} +R=6371000 +units=m"],
-  ["moll", "Mollweide", "+proj=moll +lon_0={lon0} +R=6371000 +units=m"],
-  ["eqearth", "Equal Earth", "+proj=eqearth +lon_0={lon0} +R=6371000 +units=m"],
-  ["merc", "Mercator", "+proj=merc +lon_0={lon0} +R=6371000 +units=m"],
-  ["custom", "custom PROJ string", null],
+  { key: "native", group: "", label: "native grid", tpl: null },
+  { key: "robin", group: "Global", label: "Robinson", tpl: "+proj=robin +lon_0={lon0} +R=6371000", centre: "lon" },
+  { key: "eqearth", group: "Global", label: "Equal Earth", tpl: "+proj=eqearth +lon_0={lon0} +R=6371000", centre: "lon" },
+  { key: "moll", group: "Global", label: "Mollweide", tpl: "+proj=moll +lon_0={lon0} +R=6371000", centre: "lon" },
+  { key: "eck6", group: "Global", label: "Eckert VI", tpl: "+proj=eck6 +lon_0={lon0} +R=6371000", centre: "lon" },
+  { key: "sinu", group: "Global", label: "Sinusoidal", tpl: "+proj=sinu +lon_0={lon0} +R=6371000", centre: "lon" },
+  { key: "vandg", group: "Global", label: "Van der Grinten", tpl: "+proj=vandg +lon_0={lon0} +R=6371000", centre: "lon" },
+  { key: "eqc", group: "Global", label: "Plate Carree (recentred)", tpl: "+proj=eqc +lon_0={lon0} +R=6371000", centre: "lon" },
+  { key: "cea", group: "Global", label: "Lambert cylindrical equal area", tpl: "+proj=cea +lon_0={lon0} +lat_ts=0 +R=6371000", centre: "lon" },
+  { key: "mill", group: "Global", label: "Miller cylindrical", tpl: "+proj=mill +lon_0={lon0} +R=6371000", centre: "lon" },
+  { key: "merc", group: "Global", label: "Mercator", tpl: "+proj=merc +lon_0={lon0} +R=6371000", centre: "lon" },
+  { key: "ortho", group: "Centred on a point", label: "orthographic (globe)", tpl: "+proj=ortho +lat_0={lat0} +lon_0={lon0} +R=6371000", centre: "both", reach: 90 },
+  { key: "laea", group: "Centred on a point", label: "Lambert azimuthal equal area", tpl: "+proj=laea +lat_0={lat0} +lon_0={lon0} +R=6371000", centre: "both", reach: 100 },
+  { key: "aeqd", group: "Centred on a point", label: "azimuthal equidistant", tpl: "+proj=aeqd +lat_0={lat0} +lon_0={lon0} +R=6371000", centre: "both", reach: 110 },
+  { key: "stere", group: "Centred on a point", label: "stereographic", tpl: "+proj=stere +lat_0={lat0} +lon_0={lon0} +R=6371000", centre: "both", reach: 70 },
+  { key: "gnom", group: "Centred on a point", label: "gnomonic (great circles straight)", tpl: "+proj=gnom +lat_0={lat0} +lon_0={lon0} +R=6371000", centre: "both", reach: 50 },
+  { key: "lcc", group: "Centred on a point", label: "Lambert conformal conic", tpl: "+proj=lcc +lat_0={latc} +lat_1={lat1} +lat_2={lat2} +lon_0={lon0} +datum=WGS84", centre: "both", reach: 35 },
+  { key: "aea", group: "Centred on a point", label: "Albers equal area conic", tpl: "+proj=aea +lat_0={latc} +lat_1={lat1} +lat_2={lat2} +lon_0={lon0} +datum=WGS84", centre: "both", reach: 35 },
+  { key: "tmerc", group: "Centred on a point", label: "transverse Mercator", tpl: "+proj=tmerc +lat_0=0 +lon_0={lon0} +k=0.9996 +datum=WGS84", centre: "both", reach: 25 },
+  { key: "utm", group: "Centred on a point", label: "UTM (zone from the centre)", tpl: "+proj=utm +zone={zone} {south} +datum=WGS84", centre: "both", reach: 20, rc: "zone" },
+  { key: "spstere", group: "Polar", label: "south polar stereographic, rotatable", tpl: "+proj=stere +lat_0=-90 +lat_ts=-71 +lon_0={lon0} +datum=WGS84", centre: "lon", reach: 50, rc: "south" },
+  { key: "epsg3031", group: "Polar", label: "EPSG:3031 Antarctic polar stereographic", tpl: "+proj=stere +lat_0=-90 +lat_ts=-71 +lon_0=0 +datum=WGS84", centre: "none", reach: 50, rc: "south" },
+  { key: "epsg3976", group: "Polar", label: "EPSG:3976 south polar stereographic (lat_ts -70)", tpl: "+proj=stere +lat_0=-90 +lat_ts=-70 +lon_0=0 +datum=WGS84", centre: "none", reach: 50, rc: "south" },
+  { key: "epsg3412", group: "Polar", label: "EPSG:3412 NSIDC sea ice polar stereographic south", tpl: "+proj=stere +lat_0=-90 +lat_ts=-70 +lon_0=0 +a=6378273 +b=6356889.449", centre: "none", reach: 50, rc: "south" },
+  { key: "epsg6932", group: "Polar", label: "EPSG:6932 EASE-Grid 2.0 south (LAEA)", tpl: "+proj=laea +lat_0=-90 +lon_0=0 +datum=WGS84", centre: "none", reach: 60, rc: "south" },
+  { key: "epsg3413", group: "Polar", label: "EPSG:3413 NSIDC sea ice polar stereographic north", tpl: "+proj=stere +lat_0=90 +lat_ts=70 +lon_0=-45 +datum=WGS84", centre: "none", reach: 50, rc: "north" },
+  { key: "epsg6931", group: "Polar", label: "EPSG:6931 EASE-Grid 2.0 north (LAEA)", tpl: "+proj=laea +lat_0=90 +lon_0=0 +datum=WGS84", centre: "none", reach: 60, rc: "north" },
+  { key: "epsg3577", group: "Regional", label: "EPSG:3577 Australian Albers", tpl: "+proj=aea +lat_0=0 +lon_0=132 +lat_1=-18 +lat_2=-36 +ellps=GRS80", centre: "none", reach: 30, rc: [134, -27] },
+  { key: "epsg3112", group: "Regional", label: "EPSG:3112 Australian Lambert", tpl: "+proj=lcc +lat_0=0 +lon_0=134 +lat_1=-18 +lat_2=-36 +ellps=GRS80", centre: "none", reach: 30, rc: [134, -27] },
+  { key: "epsg7855", group: "Regional", label: "EPSG:7855 MGA zone 55 (GDA2020)", tpl: "+proj=utm +zone=55 +south +ellps=GRS80", centre: "none", reach: 12, rc: [147, -40] },
+  { key: "epsg2193", group: "Regional", label: "EPSG:2193 New Zealand TM", tpl: "+proj=tmerc +lat_0=0 +lon_0=173 +k=0.9996 +x_0=1600000 +y_0=10000000 +ellps=GRS80", centre: "none", reach: 14, rc: [173, -41] },
+  { key: "epsg3035", group: "Regional", label: "EPSG:3035 Europe LAEA", tpl: "+proj=laea +lat_0=52 +lon_0=10 +x_0=4321000 +y_0=3210000 +ellps=GRS80", centre: "none", reach: 30, rc: [10, 52] },
+  { key: "epsg5070", group: "Regional", label: "EPSG:5070 CONUS Albers", tpl: "+proj=aea +lat_0=23 +lon_0=-96 +lat_1=29.5 +lat_2=45.5 +ellps=GRS80", centre: "none", reach: 30, rc: [-96, 38] },
+  { key: "geos", group: "Regional", label: "geostationary view at 140.7E", tpl: "+proj=geos +h=35785831 +lon_0=140.7 +sweep=y +datum=WGS84", centre: "none", reach: 80, rc: [140.7, 0] },
+  { key: "custom", group: "Custom", label: "custom PROJ string", tpl: null, centre: "both" },
 ];
 let proj4lib = null;
 const LIM = 2.2e7;   // projected coordinates beyond this are treated as off the map
-function projFill(tpl, c) { return tpl.replace(/\{lon0\}/g, c[0].toFixed(4)).replace(/\{lat0\}/g, c[1].toFixed(4)); }
+function projFill(tpl, c) {
+  const lon = ((((c[0] + 180) % 360) + 360) % 360) - 180, lat = Math.max(-89.9, Math.min(89.9, c[1]));
+  const zone = Math.min(60, Math.max(1, Math.floor((lon + 180) / 6) + 1));
+  const lc = Math.abs(lat) < 12 ? (lat < 0 ? -12 : 12) : lat;   // keeps conic standard parallels off the equator
+  let str = tpl.replace(/\{lon0\}/g, lon.toFixed(4)).replace(/\{lat0\}/g, lat.toFixed(4)).replace(/\{latc\}/g, lc.toFixed(4))
+    .replace(/\{lat1\}/g, (lc - 8).toFixed(4)).replace(/\{lat2\}/g, (lc + 8).toFixed(4))
+    .replace(/\{zone\}/g, String(zone)).replace(/\{south\}/g, lat < 0 ? "+south" : "");
+  // proj4js needs explicit false easting/northing for several projections
+  if (!/\+x_0=/.test(str)) str += " +x_0=0";
+  if (!/\+y_0=/.test(str)) str += " +y_0=0";
+  if (!/\+units=/.test(str)) str += " +units=m";
+  return str.replace(/\s+/g, " ").trim();
+}
+function gcDist(lon1, lat1, lon2, lat2) {
+  const r = Math.PI / 180, a = Math.sin(((lat2 - lat1) * r) / 2) ** 2 + Math.cos(lat1 * r) * Math.cos(lat2 * r) * Math.sin(((lon2 - lon1) * r) / 2) ** 2;
+  return (2 * Math.asin(Math.min(1, Math.sqrt(a)))) / r;
+}
+function presetOf(key) { return PROJS.find((p) => p.key === key); }
 function viewDims() {
   if (S.proj) return { W: S.proj.PW, H: S.proj.PH };
   const g = spatialGeom(); return { W: g.W, H: g.H };
@@ -635,15 +745,20 @@ function dataLonLatRange() {
 async function setProjection(key, opts = {}) {
   const sel = $("projSel");
   if (key === "native" || !isLonLat()) {
-    S.proj = null; if (sel) sel.value = "native"; $("projStr").style.display = "none";
+    S.proj = null; if (sel) sel.value = "native"; $("projStr").style.display = "none"; $("projCtl").style.display = "none";
     resetView(); render(); writeHashSoon(); return;
   }
   if (!proj4lib) { status("loading proj4js..."); proj4lib = (await import(PROJ4)).default; }
-  const def = PROJS.find((p) => p[0] === key);
-  const tpl = key === "custom" ? (opts.str || $("projStr").value || "+proj=ortho +lat_0={lat0} +lon_0={lon0} +R=6371000") : def[2];
+  const def = presetOf(key);
+  const tpl = key === "custom" ? (opts.str || $("projStr").value || "+proj=ortho +lat_0={lat0} +lon_0={lon0} +R=6371000") : def.tpl;
   let cen = opts.center || (S.proj && S.proj.center);
+  if (!cen && S.pick) {
+    // start from the tapped point when there is one
+    const xc = S.coords[S.dims[S.ax[1]]], yc = S.coords[S.dims[S.ax[0]]];
+    cen = [((xc[S.pick[1]] + 540) % 360) - 180, yc[S.pick[0]]];
+  }
   if (!cen) {
-    // start from the centre of what is on screen
+    // otherwise the centre of what is on screen
     const g = spatialGeom(), xc = S.coords[S.dims[S.ax[1]]], yc = S.coords[S.dims[S.ax[0]]], v = S.view;
     const col = Math.max(0, Math.min(g.W - 1, Math.floor(v.x + v.w / 2)));
     let row = Math.max(0, Math.min(g.H - 1, Math.floor(v.y + v.h / 2))); if (g.flip) row = g.H - 1 - row;
@@ -653,16 +768,32 @@ async function setProjection(key, opts = {}) {
   let conv;
   try { conv = proj4lib(str); const t = conv.forward([cen[0], cen[1]]); if (!t || !t.every(Number.isFinite)) throw new Error("projection gives no finite result at the centre"); }
   catch (e) { status("projection failed: " + e.message); return; }
-  S.proj = { key, tpl, str, conv, center: cen, cache: {} };
+  const sameKey = S.proj && S.proj.key === key;
+  let reach = opts.reach !== undefined ? opts.reach : sameKey && S.proj.reach !== undefined ? S.proj.reach : (def.reach ?? null);
+  if (!(reach > 0)) reach = null;
+  const lonC = ((((cen[0] + 180) % 360) + 360) % 360) - 180;
+  const rc = def.rc === "south" ? [0, -90] : def.rc === "north" ? [0, 90] : Array.isArray(def.rc) ? def.rc
+    : def.rc === "zone" ? [(Math.floor((lonC + 180) / 6) * 6) - 177, cen[1]] : [lonC, cen[1]];
+  S.proj = { key, tpl, str, conv, center: cen, reach, rc, cache: {} };
   // extent: forward-project a lattice over the data's lon/lat range
   const R = dataLonLatRange();
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
   for (let i = 0; i <= 180; i++) for (let j = 0; j <= 90; j++) {
-    const f = projFwd(R.lon0 + ((R.lon1 - R.lon0) * i) / 180, R.lat0 + ((R.lat1 - R.lat0) * j) / 90);
+    const lo = R.lon0 + ((R.lon1 - R.lon0) * i) / 180, la = R.lat0 + ((R.lat1 - R.lat0) * j) / 90;
+    if (reach && gcDist(lo, la, rc[0], rc[1]) > reach) continue;
+    const f = projFwd(lo, la);
     if (!f) continue;
     if (f[0] < x0) x0 = f[0]; if (f[0] > x1) x1 = f[0]; if (f[1] < y0) y0 = f[1]; if (f[1] > y1) y1 = f[1];
   }
-  if (!(x1 > x0 && y1 > y0)) { status("projection: no part of the data is visible"); S.proj = null; return; }
+  if (!(x1 > x0 && y1 > y0)) {
+    // the data may not reach the region (e.g. north polar views of a 75S-75N grid): show the reach anyway
+    for (let i = 0; i <= 72 && reach; i++) for (let j = 0; j <= 36; j++) {
+      const lo = -180 + i * 5, la = -90 + j * 5; if (gcDist(lo, la, rc[0], rc[1]) > reach) continue;
+      const f = projFwd(lo, la); if (!f) continue;
+      if (f[0] < x0) x0 = f[0]; if (f[0] > x1) x1 = f[0]; if (f[1] < y0) y0 = f[1]; if (f[1] > y1) y1 = f[1];
+    }
+    if (!(x1 > x0 && y1 > y0)) { status("projection: nothing to show"); S.proj = null; return; }
+  }
   const px = (x1 - x0) * 0.03, py = (y1 - y0) * 0.03;
   { const mr = maxRatio(), w = x1 - x0 + 2 * px, h = y1 - y0 + 2 * py; if (h / w > mr) { const extra = (h / mr - w) / 2; x0 -= extra; x1 += extra; } }
   Object.assign(S.proj, { x0: x0 - px, x1: x1 + px, y0: y0 - py, y1: y1 + py });
@@ -672,13 +803,28 @@ async function setProjection(key, opts = {}) {
   if (sel) sel.value = key;
   $("projStr").style.display = key === "custom" ? "" : "none";
   if (key === "custom") $("projStr").value = tpl;
+  syncCentreUI();
   resetView(); render(); writeHashSoon();
   status(`view: ${str}`);
 }
 function recentre(lon, lat) {
   if (!S.proj) return;
-  const k = S.proj.key, keepLat = /\{lat0\}/.test(S.proj.tpl);
-  setProjection(k, { center: [lon, keepLat ? lat : 0], str: S.proj.tpl });
+  const def = presetOf(S.proj.key), mode = def ? def.centre : "both";
+  if (mode === "none") { status(`${def.label} is a fixed CRS; pick a centred or rotatable preset to re-centre`); return; }
+  const c = mode === "lon" ? [lon, S.proj.center[1]] : [lon, lat];
+  setProjection(S.proj.key, { center: c, str: S.proj.tpl, reach: S.proj.reach });
+}
+function syncCentreUI() {
+  const on = !!S.proj, def = on ? presetOf(S.proj.key) : null, mode = def ? def.centre : "none";
+  $("projCtl").style.display = on ? "" : "none";
+  if (!on) return;
+  const shown = mode === "none" && S.proj.rc ? S.proj.rc : S.proj.center;   // fixed CRS: show where it is centred
+  const lonC = ((((shown[0] + 180) % 360) + 360) % 360) - 180;
+  $("cLon").value = lonC.toFixed(2); $("cLat").value = shown[1].toFixed(2);
+  $("cLon").disabled = mode === "none"; $("cLat").disabled = mode !== "both";
+  $("cSet").disabled = mode === "none"; $("cPick").disabled = mode === "none" || !S.pick;
+  $("cReach").value = S.proj.reach ? String(S.proj.reach) : "";
+  $("projStrShown").textContent = S.proj.str;
 }
 // virtual view pixels <-> projected coordinates
 function v2p(vx, vy) { const P = S.proj; return [P.x0 + (vx * P.w) / P.PW, P.y1 - (vy * P.h) / P.PH]; }
@@ -1271,6 +1417,7 @@ function selectAt(clientX, clientY) {
   S.sel = [Math.floor(row / g.cy), Math.floor(col / g.cx)];
   S.pick = [row, col];
   render(); showChunk(S.sel[0], S.sel[1]); showTab("tChunk");
+  if (S.proj) syncCentreUI();
   return S.sel;
 }
 (function pointerSetup() {
@@ -1336,11 +1483,30 @@ $("bOut").onclick = () => S.view && zoomAt(0.5, 0.5, 0.5);
 $("bHome").onclick = () => { resetView(); const had = S.chunkStretch; S.chunkStretch = null; if (had && S.vals) drawValues(true); else render(); writeHashSoon(); };
 $("bChunk").onclick = () => { if (S.sel) zoomToChunk(S.sel[0], S.sel[1]); else status("tap a chunk first, then zoom to it (or double-tap a chunk)"); };
 $("bCoast").onclick = () => toggleCoast(!S.coastOn);
-for (const [k, lab] of PROJS) { const o = document.createElement("option"); o.value = k; o.textContent = lab; $("projSel").append(o); }
+$("eHyp").onclick = () => { setEngine("hyp"); refresh(); };
+$("eSql").onclick = () => { setEngine("sql"); $("sqlShown").open = true; refresh(); };
+$("sqlToTab").onclick = () => { if (S.lastSliceSql) { $("sql").value = S.lastSliceSql; showTab("tSql"); } };
+{
+  const groups = {};
+  for (const p of PROJS) {
+    const o = document.createElement("option"); o.value = p.key; o.textContent = p.label;
+    if (!p.group) { $("projSel").append(o); continue; }
+    if (!groups[p.group]) { groups[p.group] = document.createElement("optgroup"); groups[p.group].label = p.group; $("projSel").append(groups[p.group]); }
+    groups[p.group].append(o);
+  }
+}
+const num = (id) => { const v = parseFloat($(id).value); return Number.isFinite(v) ? v : null; };
+$("cSet").onclick = () => { if (!S.proj) return; const lo = num("cLon"), la = num("cLat"); if (lo === null || la === null) return; setProjection(S.proj.key, { center: [lo, la], str: S.proj.tpl, reach: S.proj.reach }); };
+$("cPick").onclick = () => {
+  if (!S.proj || !S.pick) return;
+  const xc = S.coords[S.dims[S.ax[1]]], yc = S.coords[S.dims[S.ax[0]]];
+  recentre(xc[S.pick[1]], yc[S.pick[0]]);
+};
+$("cReach").addEventListener("change", () => { if (!S.proj) return; const r = num("cReach"); setProjection(S.proj.key, { center: S.proj.center, str: S.proj.tpl, reach: r && r > 0 ? r : 0 }); });
 $("projSel").onchange = () => {
   const k = $("projSel").value;
   if (k !== "native" && !isLonLat()) { status("reprojection needs the lat x lon axes"); $("projSel").value = "native"; return; }
-  setProjection(k, { center: S.proj ? S.proj.center : null });
+  setProjection(k, { center: S.proj ? S.proj.center : null, reach: undefined });
 };
 $("projStr").addEventListener("change", () => setProjection("custom", { str: $("projStr").value, center: S.proj ? S.proj.center : null }));
 $("bGebco").onclick = () => toggleGebco(!S.gebcoOn);
@@ -1416,7 +1582,15 @@ async function profileA() {
   try {
     const t0 = performance.now();
     const vals = new Array(S.nch[d]).fill(0); let nrow = 0;
-    for (let k = Math.floor(lo / R); k <= Math.floor(hi / R); k++) {
+    if (S.engine === "sql" && conn) {
+      const parts = [];
+      for (let k = Math.floor(lo / R); k <= Math.floor(hi / R); k++) {
+        const a = Math.max(lo, k * R) - k * R, b = Math.min(hi, k * R + R - 1) - k * R;
+        parts.push(`select file_row_number + ${k * R} as i, size from read_parquet('${refsUrl(k)}', file_row_number = true) where file_row_number between ${a} and ${b}`);
+      }
+      const res = await q(`select ((i - ${lo}) // ${per})::INTEGER as c, sum(size)::DOUBLE as b, count(*)::INTEGER as n from (${parts.join(" union all ")}) group by 1 order by 1`);
+      for (const r of res.rows) { vals[r.c] = r.b; nrow += r.n; }
+    } else for (let k = Math.floor(lo / R); k <= Math.floor(hi / R); k++) {
       const a = Math.max(lo, k * R) - k * R, b = Math.min(hi, k * R + R - 1) - k * R;
       const rows = await readRows(refsUrl(k), ["size"], a, b);
       rows.forEach((r, n) => { vals[Math.floor((k * R + a + n - lo) / per)] += r.size || 0; });
@@ -1647,10 +1821,11 @@ function writeHash() {
   if (!S.v) return;
   let h = `#store=${encodeURIComponent(S.store)}&var=${encodeURIComponent(S.v)}&idx=${S.idx.join(",")}&mode=${S.mode}`;
   const g = viewDims();
-  if (S.proj) { h += `&proj=${S.proj.key}&pc=${S.proj.center[0].toFixed(3)},${S.proj.center[1].toFixed(3)}`; if (S.proj.key === "custom") h += "&pstr=" + encodeURIComponent(S.proj.tpl); }
+  if (S.proj) { h += `&proj=${S.proj.key}&pc=${S.proj.center[0].toFixed(3)},${S.proj.center[1].toFixed(3)}` + (S.proj.reach ? `&reach=${S.proj.reach}` : ""); if (S.proj.key === "custom") h += "&pstr=" + encodeURIComponent(S.proj.tpl); }
   if (S.view && (S.view.w < g.W - 0.5 || S.view.h < g.H - 0.5)) h += `&view=${Math.round(S.view.x)},${Math.round(S.view.y)},${Math.round(S.view.w)},${Math.round(S.view.h)}`;
   if (S.ax && !isDefaultAxes()) h += `&ax=${S.ax[0]},${S.ax[1]}`;
   if (S.coastOn) h += "&coast=1";
+  if (S.engine === "sql") h += "&engine=sql";
   if (S.gebcoOn) h += "&gebco=1";
   history.replaceState(null, "", h);
 }
@@ -1661,10 +1836,14 @@ $("mVals").onclick = () => { setMode("values"); writeHash(); };
 $("store").onchange = async () => { const vars = await loadStore($("store").value); await loadVar(vars[0]); };
 $("var").onchange = () => loadVar($("var").value);
 
+// handle for the browser console: zx.S is the page state
+window.zx = { S, PROJS };
+
 (async function boot() {
   for (const [s, maker] of STORES) { const o = document.createElement("option"); o.value = s; o.textContent = s + "  (" + maker + ")"; $("store").append(o); }
   const h = parseHash();
   if (h.coast === "1") { S.coastOn = true; $("bCoast").classList.add("on"); }
+  if (h.engine === "sql") setEngine("sql");
   if (h.gebco === "1") { S.gebcoOn = true; $("bGebco").classList.add("on"); }
   if (h.mode === "values") { S.mode = "values"; $("mBytes").classList.remove("on"); $("mVals").classList.add("on"); }
   try {
@@ -1675,9 +1854,9 @@ $("var").onchange = () => loadVar($("var").value);
     const vars = await loadStore(store);
     const v = vars.includes(h.var) ? h.var : vars[0];
     $("var").value = v;
-    if (h.proj && h.proj !== "native" && PROJS.some((p) => p[0] === h.proj)) {
-      const pc = (h.pc || "").split(",").map(Number);
-      S.proj = { key: h.proj, tpl: h.proj === "custom" ? h.pstr : PROJS.find((p) => p[0] === h.proj)[2], center: pc.length === 2 && pc.every(Number.isFinite) ? pc : [147, -42], cache: {} };
+    if (h.proj && h.proj !== "native" && presetOf(h.proj)) {
+      const pc = (h.pc || "").split(",").map(Number), rr = parseFloat(h.reach);
+      S.proj = { key: h.proj, tpl: h.proj === "custom" ? h.pstr : presetOf(h.proj).tpl, center: pc.length === 2 && pc.every(Number.isFinite) ? pc : [147, -42], reach: Number.isFinite(rr) ? rr : undefined, cache: {} };
     }
     await loadVar(v);
   } catch (e) { status("error: " + e.message); console.error(e); }
